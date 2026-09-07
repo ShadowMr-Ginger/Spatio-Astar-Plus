@@ -16,3 +16,5 @@
 
 > Make it work, make it right, make it fast. —— Kent Beck  (2026-09-07)
 
+> Make it work, make it right, make it fast. —— Kent Beck  (2026-09-07)
+
