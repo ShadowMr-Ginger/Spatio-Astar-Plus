@@ -94,16 +94,17 @@ public static class Scheduler
 
     /// <summary>依次执行给定策略 × 各优先顺序的重试，返回 makespan 最小的成功结果；全部失败抛异常。</summary>
     /// <summary>
-    /// 软时间预算：已求得可行解后，求解总耗时超过该值就不再启动新的尝试
-    /// （未求得可行解时不受限制，必须优先保证可解）。
+    /// 软时间预算：已求得可行解后，继续用剩余顺序改进 makespan，直到总耗时超过该值。
+    /// anytime 策略：先用自然顺序快速拿保底解，再花改进预算择优。
     /// </summary>
-    private static readonly TimeSpan SoftTimeBudget = TimeSpan.FromSeconds(6);
+    private static readonly TimeSpan SoftTimeBudget = TimeSpan.FromSeconds(15);
 
     /// <summary>
-    /// 硬时间预算：连一个可行解都还没求出且总耗时超过该值时放弃全部尝试并报失败。
-    /// 只约束极端病态地图（高货物密度）的最坏求解时长；正常地图远不会触达。
+    /// 硬时间预算：连一个可行解都还没求出且总耗时超过该值时放弃并报失败（400）。
+    /// 设为 50 秒量级以保证 HTTP 请求一分钟内必有响应；此前 20 秒会把"贴着预算求解成功"
+    /// 的地图（如 30x30/100 货物约 19 秒）在系统负载稍高时误杀。
     /// </summary>
-    private static readonly TimeSpan HardTimeBudget = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan HardTimeBudget = TimeSpan.FromSeconds(50);
 
     private static ScheduleResult SolveBest(
         GridMap map,
@@ -150,8 +151,12 @@ public static class Scheduler
 
         if (best is null)
         {
+            // 汇总最后的失败类别：让用户能区分"地图无解"（冲突不可行/静态不可达）
+            // 与"求解预算不足"（预算熔断），后者明确提示可重试。
+            var kind = lastError?.Kind ?? ScheduleFailureKind.ConflictInfeasible;
             throw new SchedulerException(
-                $"已尝试 {strategies.Count * maxAttempts} 种组合仍无法完成调度：{lastError?.Message}");
+                $"已尝试 {strategies.Count * maxAttempts} 种组合仍无法完成调度（{PathFinder.KindText(kind)}）：{lastError?.Message}",
+                kind);
         }
 
         return best;
@@ -207,8 +212,26 @@ public static class Scheduler
         var pending = cargoCells.Select((c, i) => new Cargo(i, c.X, c.Y, false)).ToList();
         var events = new List<ScheduleEvent>();
 
+        // 分配阶段会从大量不同的源格反复求 BFS 距离（每次选货都算一遍），
+        // 按源格缓存整个 Plan 共享——高密度地图下这是显著的重复劳动。
+        var bfsCache = new Dictionary<(int X, int Y), int[,]>();
+        int[,] DistFrom(int x, int y)
+        {
+            if (!bfsCache.TryGetValue((x, y), out var d))
+            {
+                d = MapValidator.BfsDistances(map, new List<(int X, int Y)> { (x, y) });
+                bfsCache[(x, y)] = d;
+            }
+
+            return d;
+        }
+
+        // 本次尝试中出现过的失败类别：用于让"存在无法送达的货物"的文案能区分
+        // 真不可行与预算熔断（TryAssignTask 内部搜索被预算砍掉时只是"没试出来"）。
+        var failureKinds = new HashSet<ScheduleFailureKind>();
+
         // 每个货物按 BFS 距离升序的可达港口列表（距离相同取港口 id 小者），一次性预计算
-        var portsByCargo = PrecomputePortsByCargo(map, cargoCells, portCells);
+        var portsByCargo = PrecomputePortsByCargo(map, cargoCells, portCells, DistFrom);
         var timeLimit = TimeLimitMultiplier * map.Width * map.Height + TimeLimitExtra;
 
         // 任务分配：两种策略共用同一套"取货+送货两段路径、失败回滚换候选"机制。
@@ -216,14 +239,22 @@ public static class Scheduler
         // 仍在每个 AGV 完成配额时增量收尾（见 AssignByQuota）。
         // abort 是软预算熔断（仅在有可行解后激活）：超预算时让本次尝试快速失败，把时间让给外层收尾。
         if (strategy == AssignmentStrategy.StaticQuota)
-            AssignByQuota(map, table, states, pending, ports, portsByCargo, events, timeLimit, abort);
+            AssignByQuota(map, table, states, pending, ports, portsByCargo, events, timeLimit, abort, DistFrom, failureKinds);
         else
-            AssignDynamically(map, table, states, pending, ports, portsByCargo, events, timeLimit, abort);
+            AssignDynamically(map, table, states, pending, ports, portsByCargo, events, timeLimit, abort, DistFrom, failureKinds);
 
         if (pending.Count > 0)
         {
             var detail = string.Join("、", pending.Select(c => $"({c.X},{c.Y})"));
-            throw new SchedulerException($"存在无法送达的货物：{detail}");
+            // 失败类别向上汇总：底层失败只要包含预算熔断，本错误即归为 BudgetExhausted
+            // （"没试出来"而非"不可行"），让上层文案能明确提示可重试。
+            var hasBudget = failureKinds.Contains(ScheduleFailureKind.BudgetExhausted);
+            var hint = hasBudget
+                ? "（注意：失败原因包含求解预算熔断——搜索达到扩展/时间上限，不代表这些货物不可达，可稍后重试或降低密度）"
+                : string.Empty;
+            throw new SchedulerException(
+                $"存在无法送达的货物：{detail}{hint}",
+                hasBudget ? ScheduleFailureKind.BudgetExhausted : ScheduleFailureKind.ConflictInfeasible);
         }
 
         var result = BuildResult(map, states, ports, events);
@@ -244,12 +275,13 @@ public static class Scheduler
         GridMap map,
         ReservationTable table,
         List<AgvState> states,
-        int timeLimit)
+        int timeLimit,
+        Func<int, int, int[,]> distFrom)
     {
         foreach (var agv in states.OrderBy(s => s.Priority).ThenBy(s => s.Id))
         {
             if (agv.Active)
-                TryReturnHome(map, table, agv, timeLimit);
+                TryReturnHome(map, table, agv, timeLimit, distFrom);
 
             // 登记终态静止预留：对其他 AGV 而言其终点格从 agv.T 起永久占用
             table.ReserveResting(agv.Id, agv.X, agv.Y, agv.T);
@@ -273,7 +305,9 @@ public static class Scheduler
         List<int>[] portsByCargo,
         List<ScheduleEvent> events,
         int timeLimit,
-        Func<bool> abort)
+        Func<bool> abort,
+        Func<int, int, int[,]> distFrom,
+        HashSet<ScheduleFailureKind> failureKinds)
     {
         while (pending.Count > 0)
         {
@@ -285,7 +319,7 @@ public static class Scheduler
             {
                 if (abort())
                     break;
-                var dist = MapValidator.BfsDistances(map, new List<(int X, int Y)> { (agv.X, agv.Y) });
+                var dist = distFrom(agv.X, agv.Y);
                 var candidates = pending
                     .Where(c => dist[c.Y, c.X] >= 0)
                     .OrderBy(c => dist[c.Y, c.X])
@@ -308,7 +342,7 @@ public static class Scheduler
                         var cp = table.Checkpoint();
                         if (!agv.Active)
                             table.ReserveResting(agv.Id, agv.StartX, agv.StartY, agv.T);
-                        if (TryAssignTask(map, table, agv, cargo, ports[portId], events, timeLimit))
+                        if (TryAssignTask(map, table, agv, cargo, ports[portId], events, timeLimit, distFrom, failureKinds))
                         {
                             pending.Remove(cargo);
                             assigned = true;
@@ -336,7 +370,7 @@ public static class Scheduler
                 break; // 所有 AGV 对剩余货物均无可行路径，交回上层换序重试
         }
 
-        FinishAndRest(map, table, states, timeLimit);
+        FinishAndRest(map, table, states, timeLimit, distFrom);
     }
 
     /// <summary>
@@ -354,7 +388,9 @@ public static class Scheduler
         List<int>[] portsByCargo,
         List<ScheduleEvent> events,
         int timeLimit,
-        Func<bool> abort)
+        Func<bool> abort,
+        Func<int, int, int[,]> distFrom,
+        HashSet<ScheduleFailureKind> failureKinds)
     {
         var remaining = states.Count;
         foreach (var agv in states.OrderBy(s => s.Priority).ThenBy(s => s.Id))
@@ -369,7 +405,7 @@ public static class Scheduler
             {
                 if (abort())
                     break;
-                var dist = MapValidator.BfsDistances(map, new List<(int X, int Y)> { (agv.X, agv.Y) });
+                var dist = distFrom(agv.X, agv.Y);
                 var candidates = pending
                     .Where(c => dist[c.Y, c.X] >= 0)
                     .OrderBy(c => dist[c.Y, c.X])
@@ -381,7 +417,7 @@ public static class Scheduler
                 {
                     foreach (var portId in portsByCargo[cargo.Id])
                     {
-                        if (TryAssignTask(map, table, agv, cargo, ports[portId], events, timeLimit))
+                        if (TryAssignTask(map, table, agv, cargo, ports[portId], events, timeLimit, distFrom, failureKinds))
                         {
                             pending.Remove(cargo);
                             delivered++;
@@ -401,7 +437,7 @@ public static class Scheduler
             // 增量收尾（时机即旧实现）：该 AGV 的货物一做完立刻返场并登记终态静止预留，
             // 后续 AGV 的规划会主动避让它的停靠格，避免终点被撞、减少整体重试。
             if (agv.Active)
-                TryReturnHome(map, table, agv, timeLimit);
+                TryReturnHome(map, table, agv, timeLimit, distFrom);
             table.ReserveResting(agv.Id, agv.X, agv.Y, agv.T);
         }
     }
@@ -414,13 +450,15 @@ public static class Scheduler
         GridMap map,
         ReservationTable table,
         AgvState agv,
-        int timeLimit)
+        int timeLimit,
+        Func<int, int, int[,]> distFrom)
     {
         var checkpoint = table.Checkpoint();
         try
         {
             var homePath = PathFinder.Find(
-                map, table, agv.Id, agv.X, agv.Y, agv.T, agv.StartX, agv.StartY, agv.T + timeLimit);
+                map, table, agv.Id, agv.X, agv.Y, agv.T, agv.StartX, agv.StartY, agv.T + timeLimit,
+                distFrom(agv.StartX, agv.StartY));
             table.ReservePath(homePath);
             AppendLeg(agv, homePath);
             agv.X = agv.StartX;
@@ -473,11 +511,12 @@ public static class Scheduler
     private static List<int>[] PrecomputePortsByCargo(
         GridMap map,
         List<(int X, int Y)> cargoCells,
-        List<(int X, int Y)> portCells)
+        List<(int X, int Y)> portCells,
+        Func<int, int, int[,]> distFrom)
     {
         return cargoCells.Select(c =>
         {
-            var cargoDist = MapValidator.BfsDistances(map, new List<(int X, int Y)> { (c.X, c.Y) });
+            var cargoDist = distFrom(c.X, c.Y);
             return portCells
                 .Select((p, id) => (Id: id, Dist: cargoDist[p.Y, p.X]))
                 .Where(p => p.Dist >= 0)
@@ -492,6 +531,7 @@ public static class Scheduler
     /// 尝试为某个 AGV 规划"取货 + 送货"两段路径。
     /// 两段都成功才提交（写预留表、追加帧、记录事件）；任一失败则回滚预留表并返回 false。
     /// 第二段路径与第一段共享取货帧：取货动作发生在第一段到达货物格的同一帧。
+    /// 失败类别记录到 <paramref name="failureKinds"/>，供上层错误文案区分"不可行"与"预算熔断"。
     /// </summary>
     private static bool TryAssignTask(
         GridMap map,
@@ -500,7 +540,9 @@ public static class Scheduler
         Cargo cargo,
         Port port,
         List<ScheduleEvent> events,
-        int timeLimit)
+        int timeLimit,
+        Func<int, int, int[,]> distFrom,
+        HashSet<ScheduleFailureKind> failureKinds)
     {
         var wasActive = agv.Active;
         var checkpoint = table.Checkpoint();
@@ -513,13 +555,17 @@ public static class Scheduler
                 agv.Active = true;
             }
 
-            // 第一段：当前位置 → 货物格（时空 A*）
-            var pickupPath = PathFinder.Find(map, table, agv.Id, agv.X, agv.Y, agv.T, cargo.X, cargo.Y, agv.T + timeLimit);
+            // 第一段：当前位置 → 货物格（时空 A*）。启发值用货物格的 BFS 距离场（见 Find 注释）。
+            var pickupPath = PathFinder.Find(
+                map, table, agv.Id, agv.X, agv.Y, agv.T, cargo.X, cargo.Y, agv.T + timeLimit,
+                distFrom(cargo.X, cargo.Y));
             table.ReservePath(pickupPath);
 
             // 第二段：货物格 → 港口，与第一段共享取货帧
             var pickupT = pickupPath.EndT;
-            var dropPath = PathFinder.Find(map, table, agv.Id, cargo.X, cargo.Y, pickupT, port.X, port.Y, pickupT + timeLimit);
+            var dropPath = PathFinder.Find(
+                map, table, agv.Id, cargo.X, cargo.Y, pickupT, port.X, port.Y, pickupT + timeLimit,
+                distFrom(port.X, port.Y));
             table.ReservePath(dropPath);
 
             // 两段均可行，正式提交预留、帧与事件
@@ -539,11 +585,12 @@ public static class Scheduler
             agv.T = dropT;
             return true;
         }
-        catch (SchedulerException)
+        catch (SchedulerException ex)
         {
             // 回滚预留表；帧与事件在成功前不会写入，无需回滚
             table.Rollback(checkpoint);
             agv.Active = wasActive;
+            failureKinds.Add(ex.Kind);
             return false;
         }
     }

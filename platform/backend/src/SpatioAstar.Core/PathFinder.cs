@@ -19,11 +19,40 @@ public sealed class PlannedPath
     public (int X, int Y) EndCell => (Steps[^1].X, Steps[^1].Y);
 }
 
-/// <summary>调度求解失败时抛出，消息为面向用户的中文描述。</summary>
+/// <summary>
+/// 调度失败类别：把"真无解"和"求解预算不足"区分开，用户能据此判断是地图问题还是求解器原因。
+/// </summary>
+public enum ScheduleFailureKind
+{
+    /// <summary>
+    /// 静态不可达：货物/港口与任何 AGV 起点不在同一四连通区域，
+    /// 这类问题在 <see cref="MapValidator"/> 层面即可判定，与调度算法无关。
+    /// </summary>
+    Unreachable,
+
+    /// <summary>
+    /// 搜索预算熔断：单条搜索触达扩展次数或墙钟上限而中途放弃。
+    /// 这是求解器的资源限制，<b>不代表地图无解</b>；放宽预算或降低节点密度后可能成功。
+    /// </summary>
+    BudgetExhausted,
+
+    /// <summary>
+    /// 冲突不可行：在预留表约束与时间窗内穷举了全部可达的时空状态仍未找到无冲突路径，
+    /// 或未规划 AGV 的终点被他人永久堵住。属于"在当前规划顺序下被堵死"，换序重试可能化解。
+    /// </summary>
+    ConflictInfeasible,
+}
+
+/// <summary>调度求解失败时抛出，消息为面向用户的中文描述，并携带失败类别。</summary>
 public sealed class SchedulerException : Exception
 {
-    public SchedulerException(string message) : base(message)
+    /// <summary>失败类别，用于区分"地图无解"与"求解超时"。</summary>
+    public ScheduleFailureKind Kind { get; }
+
+    public SchedulerException(string message, ScheduleFailureKind kind = ScheduleFailureKind.ConflictInfeasible)
+        : base(message)
     {
+        Kind = kind;
     }
 }
 
@@ -41,7 +70,16 @@ public sealed class SchedulerException : Exception
 /// </summary>
 public sealed class ReservationTable
 {
-    private readonly Dictionary<(int X, int Y, int T), int> _vertices = new();
+    // 顶点预留键：t 高 32 位、y 中 16 位、x 低 16 位。
+    // 要求地图宽/高 < 65536（MapParser 已限 10000），单 long 键比三元组字典快数倍——
+    // 冲突检查是 A* 内层最热的路径，常数因子直接决定稠密地图的求解速度。
+    private const int CoordBits = 16;
+    private const long CoordMask = 0xFFFF;
+
+    private static long VertexKey(int x, int y, int t) =>
+        ((long)t << (CoordBits * 2)) | ((long)(uint)y << CoordBits) | (uint)x;
+
+    private readonly Dictionary<long, int> _vertices = new();
     private readonly HashSet<(int X1, int Y1, int X2, int Y2, int T)> _edges = new();
     /// <summary>
     /// 静止预留：AGV 完成一次卸货后从其最后一帧起占据该格，直到它被分配下一个任务。
@@ -49,10 +87,30 @@ public sealed class ReservationTable
     /// 这样"停在港口的 AGV"对后续规划者始终是可见的永久障碍，不会暗中产生冲突。
     /// </summary>
     private readonly Dictionary<int, (int X, int Y, int FromT)> _resting = new();
-    private readonly HashSet<(int X, int Y)> _pendingStarts = new();
+
+    /// <summary>格子打包：与 VertexKey 的坐标部分同构，避免元组键的哈希开销。</summary>
+    private static long CellKey(int x, int y) => ((long)(uint)y << 32) | (uint)x;
+
+    /// <summary>静止预留的反向索引：格子 → AGV id，把 IsVertexFree 里的线性扫描降为 O(1)。</summary>
+    private readonly Dictionary<long, int> _restingByCell = new();
+    private readonly HashSet<long> _pendingStarts = new();
 
     /// <summary>登记一个尚未规划路径的 AGV 起点：其他 AGV 在任何时刻都不得进入该格。</summary>
-    public void AddPendingStart(int x, int y) => _pendingStarts.Add((x, y));
+    public void AddPendingStart(int x, int y) => _pendingStarts.Add(CellKey(x, y));
+
+    /// <summary>该格是否是某个尚未规划 AGV 的待定起点（全时段障碍）。</summary>
+    public bool IsPendingStart(int x, int y) => _pendingStarts.Contains(CellKey(x, y));
+
+    /// <summary>
+    /// 目标格被他人静止停靠堵死的起始时刻：t ≥ 返回值时该格被永久占用，无需再扫描。
+    /// 返回 int.MaxValue 表示无静止占用。用于把快速失败循环从整窗扫描降为短扫描。
+    /// </summary>
+    public int RestingBlockStart(int x, int y, int agvId)
+    {
+        if (_restingByCell.TryGetValue(CellKey(x, y), out var restingAgv) && restingAgv != agvId)
+            return _resting[restingAgv].FromT;
+        return int.MaxValue;
+    }
 
     /// <summary>
     /// 判断 agvId 在时刻 t 能否占据 (x,y)。
@@ -60,17 +118,18 @@ public sealed class ReservationTable
     /// </summary>
     public bool IsVertexFree(int x, int y, int t, int agvId)
     {
-        if (_vertices.TryGetValue((x, y, t), out var owner) && owner != agvId)
+        if (_vertices.TryGetValue(VertexKey(x, y, t), out var owner) && owner != agvId)
             return false;
 
-        foreach (var (restingAgv, cell) in _resting)
+        // 静止预留 O(1) 查询：该格被他人从 FromT 起常驻占用即冲突
+        if (_restingByCell.TryGetValue(CellKey(x, y), out var restingAgv))
         {
-            if (restingAgv != agvId && cell.X == x && cell.Y == y && t >= cell.FromT)
+            if (restingAgv != agvId && _resting[restingAgv].FromT <= t)
                 return false;
         }
 
         // 起点待定说明该 AGV 还没规划，可能一直停在此处；但搜索时不会查到自己（已先移除）
-        return !_pendingStarts.Contains((x, y));
+        return !_pendingStarts.Contains(CellKey(x, y));
     }
 
     /// <summary>
@@ -90,11 +149,26 @@ public sealed class ReservationTable
     public void ReserveResting(int agvId, int x, int y, int fromT)
     {
         var hadValue = _resting.TryGetValue(agvId, out var oldValue);
+        var newKey = CellKey(x, y);
+        var hadCell = _restingByCell.TryGetValue(newKey, out var priorCellAgv);
+        // 覆盖旧记录时旧终点格随之释放：先清掉旧格上的映射，再写新格
+        var oldCell = hadValue ? (X: oldValue.X, Y: oldValue.Y) : (X: 0, Y: 0);
+        var hadOldCell = hadValue && (oldValue.X != x || oldValue.Y != y);
+        var oldCellHadMapping = false;
+        var oldCellPriorAgv = -1;
+        if (hadOldCell)
+            oldCellHadMapping = _restingByCell.TryGetValue(CellKey(oldCell.X, oldCell.Y), out oldCellPriorAgv);
+        if (hadOldCell) _restingByCell.Remove(CellKey(oldCell.X, oldCell.Y));
         _resting[agvId] = (x, y, fromT);
+        _restingByCell[newKey] = agvId;
         _undoLog.Add(() =>
         {
             if (hadValue) _resting[agvId] = oldValue;
             else _resting.Remove(agvId);
+            if (oldCellHadMapping) _restingByCell[CellKey(oldCell.X, oldCell.Y)] = oldCellPriorAgv;
+            else if (hadOldCell) _restingByCell.Remove(CellKey(oldCell.X, oldCell.Y));
+            if (hadCell) _restingByCell[newKey] = priorCellAgv;
+            else _restingByCell.Remove(newKey);
         });
     }
 
@@ -118,8 +192,9 @@ public sealed class ReservationTable
     /// <summary>AGV 开始规划第一条路径时调用：其起点不再对他人构成全时段障碍（改由顶点预留精确描述）。支持回滚。</summary>
     public void RemovePendingStart(int x, int y)
     {
-        _pendingStarts.Remove((x, y));
-        _undoLog.Add(() => _pendingStarts.Add((x, y)));
+        var key = CellKey(x, y);
+        _pendingStarts.Remove(key);
+        _undoLog.Add(() => _pendingStarts.Add(key));
     }
 
     /// <summary>将一条已规划路径写入预留表：逐帧预留顶点，移动步额外预留有向边。支持回滚。</summary>
@@ -129,7 +204,7 @@ public sealed class ReservationTable
         {
             var step = path.Steps[j];
             var t = path.StartT + j;
-            var key = (step.X, step.Y, t);
+            var key = VertexKey(step.X, step.Y, t);
             var hadValue = _vertices.TryGetValue(key, out var oldValue);
             _vertices[key] = path.AgvId;
             _undoLog.Add(() =>
@@ -173,6 +248,11 @@ public static class PathFinder
     /// 为 agvId 从 (startX,startY,startT) 规划到 (goalX,goalY) 的无冲突时空路径。
     /// </summary>
     /// <param name="timeLimit">搜索的时间上限；超过后抛出 <see cref="SchedulerException"/>。</param>
+    /// <param name="distToGoal">
+    /// 可选的静态距离启发值：dist[y,x] 表示 (x,y) 到目标的纯行走距离（多源 BFS，不可达为 -1）。
+    /// 网格四向对称，以目标为源做 BFS 即得。比曼哈顿距离更紧且仍可采纳（等待只会更慢），
+    /// 障碍密集地图可大幅削减扩展数；同时为 -1 的状态可作静态死路直接剪枝。
+    /// </param>
     public static PlannedPath Find(
         GridMap map,
         ReservationTable table,
@@ -182,23 +262,36 @@ public static class PathFinder
         int startT,
         int goalX,
         int goalY,
-        int timeLimit)
+        int timeLimit,
+        int[,]? distToGoal = null)
     {
-        // 快速失败：目标格在整个时间窗内都被占用（如被静止的 AGV 永久堵住），
-        // 任何搜索都不可能成功，直接抛出，避免为证明失败而穷举整个时空状态空间
+        // 搜索窗收紧：无冲突路径若存在，极少需要超过"全图格数"量级的等待；
+        // 失败穷举的状态空间随窗长线性膨胀，收紧后失败成本近减半。
+        // 成功路径几乎不会触顶；真被误杀的极端长等待场景由外层换策略/换序重试兜底。
+        var tCap = Math.Min(timeLimit, startT + map.Width * map.Height + 256);
+        // 静止停靠是永久占用：goal 被他人停靠堵死时只需扫到停靠起点之前，
+        // 把 O(窗口) 的快速失败循环降为 O(实际占用帧数)。
+        var scanCap = Math.Min(tCap, table.RestingBlockStart(goalX, goalY, agvId) - 1);
         var goalEverFree = false;
-        for (var t = startT; t <= timeLimit; t++)
+        if (scanCap >= startT && !table.IsPendingStart(goalX, goalY))
         {
-            if (table.IsVertexFree(goalX, goalY, t, agvId))
+            for (var t = startT; t <= scanCap; t++)
             {
-                goalEverFree = true;
-                break;
+                if (table.IsVertexFree(goalX, goalY, t, agvId))
+                {
+                    goalEverFree = true;
+                    break;
+                }
             }
         }
 
         if (!goalEverFree)
+        {
             throw new SchedulerException(
-                $"AGV {agvId} 路径规划失败：目标 ({goalX},{goalY}) 在时间上限内均被占用");
+                $"AGV {agvId} 路径规划失败（{KindText(ScheduleFailureKind.ConflictInfeasible)}）：" +
+                $"目标 ({goalX},{goalY}) 在整个时间窗内均被预留占用（可能被已完成 AGV 的静止停靠或待规划 AGV 的起点永久堵住）",
+                ScheduleFailureKind.ConflictInfeasible);
+        }
 
         // 时空状态编码为单个 int：id = (t * height + y) * width + x。
         // 比 (x,y,t) 元组字典快数倍——稠密地图的深等待搜索依赖这个常数因子。
@@ -207,15 +300,16 @@ public static class PathFinder
         var height = map.Height;
         var tStride = width * height;
         int Encode(int x, int y, int t) => t * tStride + y * width + x;
-        var open = new PriorityQueue<int, (int F, int Seq)>();
-        var parent = new Dictionary<int, int>(1 << 16);
+        var open = new PriorityQueue<int, (int F, int H, int Seq)>();
+        var parent = new Dictionary<int, int>(1 << 10);
         var seq = 0;
         var expansions = 0;
         var findSw = Stopwatch.StartNew();
 
         var startId = Encode(startX, startY, startT);
         parent[startId] = -1;
-        open.Enqueue(startId, (startT + Heuristic(startX, startY, goalX, goalY), seq++));
+        var startH = distToGoal?[startY, startX] is >= 0 ? distToGoal[startY, startX] : Heuristic(startX, startY, goalX, goalY);
+        open.Enqueue(startId, (startT + startH, startH, seq++));
 
         while (open.Count > 0)
         {
@@ -227,15 +321,29 @@ public static class PathFinder
                 return Reconstruct(curId, parent, agvId, startT, width, height);
 
             var nextT = curT + 1;
-            if (nextT > timeLimit)
-                continue; // 超出时间上限的扩展直接丢弃，队列耗尽时统一报失败
+            if (nextT > tCap)
+                continue; // 超出搜索窗的扩展直接丢弃，队列耗尽时统一报失败
 
-            // 搜索规模保护：为证明"不可行"而穷举超大时空状态空间代价极高，
-            // 超过阈值后快速失败，交由上层的候选回退/顺序重试处理。
-            // 双保险：扩展次数上限 + 单条搜索的墙钟上限（时间上限内也可能因
-            // 时间维约束导致近乎穷举，二者任一触发即放弃本条搜索）。
-            if (++expansions > MaxExpansions || findSw.Elapsed > MaxFindTime)
-                break;
+            // 搜索规模保护：为证明"不可行"而穷举超大时空状态空间代价极高，超过预算后快速失败。
+            // 主上限是扩展次数（确定性、与机器负载无关）；墙钟只作兜底防挂死。
+            // 两者都报 BudgetExhausted——这是预算熔断，不代表地图无解。
+            if (++expansions > MaxExpansions)
+            {
+                throw new SchedulerException(
+                    $"AGV {agvId} 路径规划失败（{KindText(ScheduleFailureKind.BudgetExhausted)}）：" +
+                    $"搜索超过扩展次数上限（{MaxExpansions:N0} 次）而熔断，属于求解预算原因，不代表地图无解；" +
+                    $"可降低货物/AGV 密度或稍后重试",
+                    ScheduleFailureKind.BudgetExhausted);
+            }
+
+            if (findSw.Elapsed > MaxFindTime)
+            {
+                throw new SchedulerException(
+                    $"AGV {agvId} 路径规划失败（{KindText(ScheduleFailureKind.BudgetExhausted)}）：" +
+                    $"搜索超过单条墙钟上限（{MaxFindTime.TotalSeconds:N0} 秒）而熔断，属于求解预算原因，不代表地图无解；" +
+                    $"可降低货物/AGV 密度或稍后重试",
+                    ScheduleFailureKind.BudgetExhausted);
+            }
 
             // 四方向移动
             foreach (var (dx, dy) in Directions)
@@ -250,26 +358,40 @@ public static class PathFinder
                 // 边冲突：与他人 nextT-1→nextT 的移动互换位置
                 if (!table.IsEdgeFree(curX, curY, nx, ny, nextT, agvId))
                     continue;
-                TryEnqueue(open, parent, ref seq, curId, nx, ny, nextT, goalX, goalY, width, height);
+                TryEnqueue(open, parent, ref seq, curId, nx, ny, nextT, goalX, goalY, width, height, distToGoal);
             }
 
             // 原地等待（等待也可能冲突：他人可能移动到当前格）
             if (table.IsVertexFree(curX, curY, nextT, agvId))
-                TryEnqueue(open, parent, ref seq, curId, curX, curY, nextT, goalX, goalY, width, height);
+                TryEnqueue(open, parent, ref seq, curId, curX, curY, nextT, goalX, goalY, width, height, distToGoal);
         }
 
         throw new SchedulerException(
-            $"AGV {agvId} 路径规划失败：无法在时间上限内从 ({startX},{startY}) 到达 ({goalX},{goalY})，请检查地图或降低节点密度");
+            $"AGV {agvId} 路径规划失败（{KindText(ScheduleFailureKind.ConflictInfeasible)}）：" +
+            $"在时间窗内穷举了全部可达的时空状态仍未找到无冲突路径（被其他 AGV 的预留堵死）",
+            ScheduleFailureKind.ConflictInfeasible);
     }
 
-    /// <summary>单条路径搜索的最大扩展次数（防卡死的规模保护）。</summary>
-    private const int MaxExpansions = 2_000_000;
+    /// <summary>失败类别对应的用户可读前缀。</summary>
+    internal static string KindText(ScheduleFailureKind kind) => kind switch
+    {
+        ScheduleFailureKind.Unreachable => "静态不可达",
+        ScheduleFailureKind.BudgetExhausted => "求解预算熔断",
+        ScheduleFailureKind.ConflictInfeasible => "冲突不可行",
+        _ => "未知原因",
+    };
 
-    /// <summary>单条路径搜索的墙钟时间上限：时间维约束可能让不可行搜索近乎穷举，用它兜底快速失败。</summary>
-    private static readonly TimeSpan MaxFindTime = TimeSpan.FromSeconds(2);
+    // ---- 预算参数 ----
 
+    /// <summary>单条路径搜索的最大扩展次数（主要预算上限，确定性、与机器负载无关；测试可临时调小）。</summary>
+    internal static int MaxExpansions = 2_000_000;
+
+    /// <summary>单条路径搜索的墙钟兜底上限：只防意外挂死，正常搜索远不会触达。</summary>
+    internal static TimeSpan MaxFindTime = TimeSpan.FromSeconds(10);
+
+    /// <summary>优先级三元组：f 升序，同 f 时 h 升序（先扩展更靠近目标），再按入队序号 FIFO 打破平局。</summary>
     private static void TryEnqueue(
-        PriorityQueue<int, (int F, int Seq)> open,
+        PriorityQueue<int, (int F, int H, int Seq)> open,
         Dictionary<int, int> parent,
         ref int seq,
         int curId,
@@ -279,14 +401,28 @@ public static class PathFinder
         int goalX,
         int goalY,
         int width,
-        int height)
+        int height,
+        int[,]? distToGoal)
     {
         var nextId = nextT * width * height + ny * width + nx;
-        if (parent.ContainsKey(nextId))
-            return; // 该时空状态已访问（g 恒等于 t，首次到达即最优）
+        int h;
+        if (distToGoal is not null)
+        {
+            var d = distToGoal[ny, nx];
+            if (d < 0)
+                return; // 静态不可达：该格到不了目标，经此状态的搜索分支无解，直接剪枝
+            h = d;
+        }
+        else
+        {
+            h = Heuristic(nx, ny, goalX, goalY);
+        }
 
-        parent[nextId] = curId;
-        open.Enqueue(nextId, (nextT + Heuristic(nx, ny, goalX, goalY), seq++));
+        // 该时空状态已访问则跳过（g 恒等于 t，首次到达即最优）
+        if (!parent.TryAdd(nextId, curId))
+            return;
+
+        open.Enqueue(nextId, (nextT + h, h, seq++));
     }
 
     private static PlannedPath Reconstruct(

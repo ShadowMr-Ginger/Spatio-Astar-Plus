@@ -66,6 +66,9 @@ public static class MapParser
         if (rows.Count == 0)
             throw new MapParseException("地图内容为空");
 
+        if (width > 10_000 || rows.Count > 10_000)
+            throw new MapParseException($"地图尺寸过大（{width}x{rows.Count}），宽高均不能超过 10000");
+
         var grid = new int[rows.Count, width];
         for (var y = 0; y < rows.Count; y++)
         for (var x = 0; x < width; x++)
