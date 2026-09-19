@@ -1,11 +1,13 @@
 "use client";
 
 // 主页面：左侧控制面板 + 右侧地图动画 / 播放器 / 统计 / 导出
+// 播放时钟按子步推进：子步索引 = t*3 + k（k ∈ {0,1,2}），逻辑帧时长基准 250ms
 
 import { useCallback, useEffect, useState } from "react";
 import ControlPanel from "@/components/ControlPanel";
 import MapCanvas from "@/components/MapCanvas";
 import PlayerControls from "@/components/PlayerControls";
+import { useI18n } from "@/lib/i18n";
 import {
   ApiError,
   downloadBlob,
@@ -14,6 +16,7 @@ import {
   scheduleToCsv,
 } from "@/lib/api";
 import { getMockSchedule } from "@/lib/mock";
+import { frameOf, maxSubStep, phaseOf, SUBSTEPS_PER_FRAME } from "@/lib/render";
 import type { MapGenParams, ScheduleResult } from "@/lib/types";
 
 // 地图生成参数的默认值
@@ -33,24 +36,27 @@ interface MapPreview {
   grid: number[][];
 }
 
-// 基础帧率：1x 速度下每 250ms 推进一帧
+// 基础帧率：1x 速度下逻辑帧时长 250ms，拆 3 子步后每子步 ≈ 83ms
 const BASE_FRAME_MS = 250;
 
-const LEGEND = [
-  { color: "#ffffff", stroke: true, label: "路径" },
-  { color: "#475569", label: "障碍" },
-  { color: "#f59e0b", label: "货物" },
-  { color: "#2563eb", label: "AGV" },
-  { color: "#7c3aed", label: "AGV（载货）" },
-  { color: "#10b981", label: "港口" },
+// 图例（颜色与 MapCanvas 内 COLORS 一致，文案走 i18n）
+const LEGEND_ITEMS: Array<{ key: "path" | "obstacle" | "cargo" | "agv" | "agvCarry" | "port"; color: string; stroke?: boolean }> = [
+  { key: "path", color: "#ffffff", stroke: true },
+  { key: "obstacle", color: "#475569" },
+  { key: "cargo", color: "#f59e0b" },
+  { key: "agv", color: "#2563eb" },
+  { key: "agvCarry", color: "#7c3aed" },
+  { key: "port", color: "#10b981" },
 ];
 
 export default function Home() {
+  const { lang, setLang, t } = useI18n();
   const [params, setParams] = useState<MapGenParams>(DEFAULT_PARAMS);
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<MapPreview | null>(null);
   const [result, setResult] = useState<ScheduleResult | null>(null);
-  const [frameIdx, setFrameIdx] = useState(0);
+  // 播放时钟：子步索引（t*3 + k），进度条/帧计数仍以逻辑帧为单位
+  const [subIdx, setSubIdx] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [generating, setGenerating] = useState(false);
@@ -58,6 +64,9 @@ export default function Home() {
   const [errors, setErrors] = useState<string[]>([]);
 
   const totalFrames = result?.frames.length ?? 0;
+  const maxSub = maxSubStep(totalFrames);
+  const curT = result ? Math.min(frameOf(subIdx), totalFrames - 1) : 0;
+  const phase = result ? phaseOf(subIdx) : 0;
 
   /** 选择文件后本地解析 CSV，用于运行前的静态地图预览 */
   const handleFileChange = useCallback(async (f: File | null) => {
@@ -82,15 +91,19 @@ export default function Home() {
         );
       if (!valid) {
         setPreview(null);
-        setErrors(["地图文件格式不正确：应为逗号分隔的 0-4 数字网格"]);
+        setErrors([
+          lang === "zh"
+            ? "地图文件格式不正确：应为逗号分隔的 0-4 数字网格"
+            : "Invalid map file: expected a comma-separated grid of digits 0-4",
+        ]);
         return;
       }
       setPreview({ width: grid[0].length, height: grid.length, grid });
     } catch {
       setPreview(null);
-      setErrors(["读取地图文件失败"]);
+      setErrors([lang === "zh" ? "读取地图文件失败" : "Failed to read the map file"]);
     }
-  }, []);
+  }, [lang]);
 
   /** 生成随机地图并触发下载 */
   const handleGenerate = useCallback(async () => {
@@ -99,11 +112,15 @@ export default function Home() {
     try {
       await generateMapCsv(params);
     } catch (e) {
-      setErrors(e instanceof ApiError ? e.errors : ["生成地图失败，请检查后端服务"]);
+      setErrors(
+        e instanceof ApiError
+          ? e.errors
+          : [lang === "zh" ? "生成地图失败，请检查后端服务" : "Failed to generate map; is the backend running?"]
+      );
     } finally {
       setGenerating(false);
     }
-  }, [params]);
+  }, [params, lang]);
 
   /** 上传当前文件并运行调度算法 */
   const handleRun = useCallback(async () => {
@@ -114,52 +131,67 @@ export default function Home() {
     try {
       const data = await runSchedule(file);
       setResult(data);
-      setFrameIdx(0);
+      setSubIdx(0);
     } catch (e) {
-      setErrors(e instanceof ApiError ? e.errors : ["算法运行失败，请检查后端服务"]);
+      setErrors(
+        e instanceof ApiError
+          ? e.errors
+          : [lang === "zh" ? "算法运行失败，请检查后端服务" : "Algorithm run failed; is the backend running?"]
+      );
     } finally {
       setRunning(false);
     }
-  }, [file]);
+  }, [file, lang]);
 
   /** 载入本地示例数据（后端未启动时预览界面效果） */
   const handleLoadDemo = useCallback(() => {
     const demo = getMockSchedule();
     setResult(demo);
     setPreview({ width: demo.width, height: demo.height, grid: demo.grid });
-    setFrameIdx(0);
+    setSubIdx(0);
     setPlaying(false);
     setErrors([]);
   }, []);
 
-  // 播放驱动：按速度换算间隔推进帧，播完自动停止
+  // 播放驱动：按子步推进（1x 时子步间隔 ≈ 250/3 ms），播完自动停止
   useEffect(() => {
     if (!playing || !result) return;
     const timer = window.setInterval(() => {
-      setFrameIdx((f) => {
-        if (f >= result.frames.length - 1) {
+      setSubIdx((s) => {
+        if (s >= maxSubStep(result.frames.length)) {
           setPlaying(false);
-          return f;
+          return s;
         }
-        return f + 1;
+        return s + 1;
       });
-    }, BASE_FRAME_MS / speed);
+    }, BASE_FRAME_MS / SUBSTEPS_PER_FRAME / speed);
     return () => window.clearInterval(timer);
   }, [playing, speed, result]);
 
+  /** 以逻辑帧为单位 seek（子步对齐到帧首） */
   const handleSeek = useCallback(
     (f: number) => {
       if (!result) return;
-      setFrameIdx(Math.min(Math.max(0, f), result.frames.length - 1));
+      const clamped = Math.min(Math.max(0, f), result.frames.length - 1);
+      setSubIdx(clamped * SUBSTEPS_PER_FRAME);
     },
     [result]
   );
+
+  /** 播放/暂停；已播到结尾时再按播放则从头开始 */
+  const handleTogglePlay = useCallback(() => {
+    if (!result) return;
+    if (!playing && subIdx >= maxSub) setSubIdx(0);
+    setPlaying((p) => !p);
+  }, [result, playing, subIdx, maxSub]);
 
   // Canvas 数据源：运行结果优先，否则用上传文件的静态预览
   const mapData = result
     ? { width: result.width, height: result.height, grid: result.grid }
     : preview;
-  const currentFrame = result?.frames[frameIdx] ?? null;
+  const currentFrame = result?.frames[curT] ?? null;
+  const nextFrame =
+    result && curT < totalFrames - 1 ? result.frames[curT + 1] : null;
 
   /** 导出调度方案 JSON */
   const handleExportJson = useCallback(() => {
@@ -183,15 +215,31 @@ export default function Home() {
 
   return (
     <div className="flex min-h-screen flex-col">
-      {/* 顶部标题栏 */}
+      {/* 顶部标题栏 + 语言切换 */}
       <header className="border-b border-slate-200 bg-white shadow-sm">
-        <div className="mx-auto max-w-7xl px-6 py-4">
-          <h1 className="text-xl font-bold text-slate-800">
-            Spatio A* 多 AGV 调度演示平台
-          </h1>
-          <p className="mt-0.5 text-sm text-slate-500">
-            时空 A* 路径规划 · 多 AGV 货物调度 · 逐帧动画回放
-          </p>
+        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
+          <div>
+            <h1 className="text-xl font-bold text-slate-800">
+              {t("app.title")}
+            </h1>
+            <p className="mt-0.5 text-sm text-slate-500">{t("app.subtitle")}</p>
+          </div>
+          <div className="flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 p-1">
+            {(["zh", "en"] as const).map((l) => (
+              <button
+                key={l}
+                type="button"
+                onClick={() => setLang(l)}
+                className={`h-8 rounded-md px-3 text-sm font-medium transition ${
+                  lang === l
+                    ? "bg-indigo-600 text-white shadow-sm"
+                    : "text-slate-500 hover:text-slate-700"
+                }`}
+              >
+                {t(l === "zh" ? "lang.zh" : "lang.en")}
+              </button>
+            ))}
+          </div>
         </div>
       </header>
 
@@ -218,7 +266,7 @@ export default function Home() {
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
             <div className="mb-2 flex items-center justify-between">
               <h2 className="text-sm font-semibold text-slate-700">
-                {result ? "调度动画" : "地图预览"}
+                {result ? t("canvas.animating") : t("canvas.preview")}
               </h2>
               {mapData && (
                 <span className="font-mono text-xs text-slate-400">
@@ -232,21 +280,22 @@ export default function Home() {
                 height={mapData.height}
                 grid={mapData.grid}
                 cargos={result?.cargos}
+                events={result?.events}
                 frame={currentFrame}
+                nextFrame={nextFrame}
+                phase={phase}
               />
             ) : (
               <div className="flex h-[480px] flex-col items-center justify-center gap-2 text-slate-400">
                 <span className="text-4xl">🗺️</span>
-                <p className="text-sm">
-                  请先生成地图或上传 CSV 文件，也可以载入示例数据
-                </p>
+                <p className="text-sm">{t("canvas.empty")}</p>
               </div>
             )}
             {/* 图例 */}
             <div className="mt-2 flex flex-wrap items-center gap-4 border-t border-slate-100 pt-3">
-              {LEGEND.map((item) => (
+              {LEGEND_ITEMS.map((item) => (
                 <span
-                  key={item.label}
+                  key={item.key}
                   className="flex items-center gap-1.5 text-xs text-slate-500"
                 >
                   <span
@@ -255,7 +304,7 @@ export default function Home() {
                     }`}
                     style={{ backgroundColor: item.color }}
                   />
-                  {item.label}
+                  {t(`legend.${item.key}`)}
                 </span>
               ))}
             </div>
@@ -264,12 +313,12 @@ export default function Home() {
           {/* 动画播放器 */}
           <PlayerControls
             playing={playing}
-            frame={frameIdx}
+            frame={curT}
             totalFrames={totalFrames}
             speed={speed}
-            onTogglePlay={() => setPlaying((p) => !p)}
-            onPrev={() => handleSeek(frameIdx - 1)}
-            onNext={() => handleSeek(frameIdx + 1)}
+            onTogglePlay={handleTogglePlay}
+            onPrev={() => handleSeek(curT - 1)}
+            onNext={() => handleSeek(curT + 1)}
             onSeek={handleSeek}
             onSpeedChange={setSpeed}
             disabled={!result}
@@ -278,21 +327,23 @@ export default function Home() {
           {/* 统计卡片 */}
           <div className="grid grid-cols-3 gap-4">
             <div className="rounded-2xl border border-slate-200 bg-white p-4 text-center shadow-sm">
-              <p className="text-xs text-slate-400">总帧数（makespan）</p>
+              <p className="text-xs text-slate-400">{t("stats.makespan")}</p>
               <p className="mt-1 text-2xl font-bold text-slate-800">
                 {result ? result.stats.makespan : "--"}
               </p>
             </div>
             <div className="rounded-2xl border border-slate-200 bg-white p-4 text-center shadow-sm">
-              <p className="text-xs text-slate-400">总移动步数</p>
+              <p className="text-xs text-slate-400">{t("stats.moves")}</p>
               <p className="mt-1 text-2xl font-bold text-slate-800">
                 {result ? result.stats.totalMoves : "--"}
               </p>
             </div>
             <div className="rounded-2xl border border-slate-200 bg-white p-4 text-center shadow-sm">
-              <p className="text-xs text-slate-400">已送达货物</p>
+              <p className="text-xs text-slate-400">{t("stats.delivered")}</p>
               <p className="mt-1 text-2xl font-bold text-slate-800">
-                {result ? `${result.stats.deliveries} / ${result.cargos.length}` : "--"}
+                {result
+                  ? `${result.stats.deliveries} / ${result.cargos.length}`
+                  : "--"}
               </p>
             </div>
           </div>
@@ -305,7 +356,7 @@ export default function Home() {
               disabled={!result}
               className="h-10 rounded-lg bg-indigo-600 px-5 text-sm font-medium text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              导出调度方案（JSON）
+              {t("export.json")}
             </button>
             <button
               type="button"
@@ -313,7 +364,7 @@ export default function Home() {
               disabled={!result}
               className="h-10 rounded-lg border border-indigo-200 px-5 text-sm font-medium text-indigo-600 transition hover:bg-indigo-50 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              导出 CSV（逐帧动作表）
+              {t("export.csv")}
             </button>
           </div>
         </section>

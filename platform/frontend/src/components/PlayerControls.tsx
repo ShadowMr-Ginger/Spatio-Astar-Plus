@@ -2,8 +2,11 @@
 
 // 动画播放控制条：播放/暂停、逐帧步进、可拖动进度条、倍速选择
 
+import { useI18n } from "@/lib/i18n";
+
 interface PlayerControlsProps {
   playing: boolean;
+  /** 当前逻辑帧号 t（子步插值后仍按逻辑帧显示） */
   frame: number;
   totalFrames: number;
   speed: number;
@@ -29,6 +32,7 @@ export default function PlayerControls({
   onSpeedChange,
   disabled,
 }: PlayerControlsProps) {
+  const { t } = useI18n();
   const maxFrame = Math.max(0, totalFrames - 1);
 
   return (
@@ -39,7 +43,7 @@ export default function PlayerControls({
           type="button"
           onClick={onPrev}
           disabled={disabled || frame <= 0}
-          title="上一帧"
+          title={t("player.prev")}
           className="h-9 w-9 rounded-lg border border-slate-200 text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
         >
           ⏮
@@ -48,7 +52,7 @@ export default function PlayerControls({
           type="button"
           onClick={onTogglePlay}
           disabled={disabled}
-          title={playing ? "暂停" : "播放"}
+          title={playing ? t("player.pause") : t("player.play")}
           className="h-9 w-12 rounded-lg bg-indigo-600 text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-40"
         >
           {playing ? "⏸" : "▶"}
@@ -57,14 +61,14 @@ export default function PlayerControls({
           type="button"
           onClick={onNext}
           disabled={disabled || frame >= maxFrame}
-          title="下一帧"
+          title={t("player.next")}
           className="h-9 w-9 rounded-lg border border-slate-200 text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
         >
           ⏭
         </button>
       </div>
 
-      {/* 进度条（可拖动 seek） */}
+      {/* 进度条（以逻辑帧为单位拖动 seek） */}
       <input
         type="range"
         min={0}
@@ -75,9 +79,9 @@ export default function PlayerControls({
         className="h-2 flex-1 cursor-pointer appearance-none rounded-lg bg-slate-200 accent-indigo-600 disabled:cursor-not-allowed disabled:opacity-40"
       />
 
-      {/* 帧计数 */}
-      <span className="min-w-[90px] text-right font-mono text-sm text-slate-600">
-        {disabled ? "-- / --" : `${frame} / ${maxFrame}`}
+      {/* 帧计数（逻辑帧） */}
+      <span className="min-w-[110px] text-right font-mono text-sm text-slate-600">
+        {disabled ? "-- / --" : `${t("player.frame")} ${frame} / ${maxFrame}`}
       </span>
 
       {/* 倍速选择 */}

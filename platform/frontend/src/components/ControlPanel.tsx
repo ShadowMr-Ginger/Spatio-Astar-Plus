@@ -3,6 +3,7 @@
 // 左侧控制面板：地图生成参数、生成/上传/运行按钮、错误展示
 
 import { useRef, useState } from "react";
+import { useI18n } from "@/lib/i18n";
 import type { MapGenParams } from "@/lib/types";
 
 interface ControlPanelProps {
@@ -66,6 +67,7 @@ export default function ControlPanel({
   errors,
   onLoadDemo,
 }: ControlPanelProps) {
+  const { t } = useI18n();
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragOver, setDragOver] = useState(false);
 
@@ -76,46 +78,46 @@ export default function ControlPanel({
       {/* 地图生成参数 */}
       <section>
         <h2 className="mb-3 text-sm font-semibold text-slate-700">
-          地图生成参数
+          {t("panel.mapParams")}
         </h2>
         <div className="grid grid-cols-2 gap-3">
           <NumberField
-            label="宽度 width"
+            label={t("panel.width")}
             value={params.width}
             min={4}
             max={200}
             onChange={(v) => onParamsChange({ ...params, width: v })}
           />
           <NumberField
-            label="高度 height"
+            label={t("panel.height")}
             value={params.height}
             min={4}
             max={200}
             onChange={(v) => onParamsChange({ ...params, height: v })}
           />
           <NumberField
-            label="AGV 数量"
+            label={t("panel.agvCount")}
             value={params.agvCount}
             min={1}
             max={50}
             onChange={(v) => onParamsChange({ ...params, agvCount: v })}
           />
           <NumberField
-            label="货物数量"
+            label={t("panel.cargoCount")}
             value={params.cargoCount}
             min={1}
             max={200}
             onChange={(v) => onParamsChange({ ...params, cargoCount: v })}
           />
           <NumberField
-            label="港口数量"
+            label={t("panel.portCount")}
             value={params.portCount}
             min={1}
             max={20}
             onChange={(v) => onParamsChange({ ...params, portCount: v })}
           />
           <NumberField
-            label="障碍比例"
+            label={t("panel.obstacleRatio")}
             value={params.obstacleRatio}
             min={0}
             max={0.9}
@@ -129,18 +131,18 @@ export default function ControlPanel({
           disabled={busy}
           className="mt-4 h-10 w-full rounded-lg bg-indigo-600 text-sm font-medium text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {generating ? "正在生成地图…" : "生成随机地图"}
+          {generating ? t("panel.generating") : t("panel.generate")}
         </button>
-        <p className="mt-2 text-xs text-slate-400">
-          生成的地图将以 map.csv 自动下载
-        </p>
+        <p className="mt-2 text-xs text-slate-400">{t("panel.generateHint")}</p>
       </section>
 
       <hr className="border-slate-100" />
 
       {/* 文件上传区（点击或拖拽） */}
       <section>
-        <h2 className="mb-3 text-sm font-semibold text-slate-700">地图文件</h2>
+        <h2 className="mb-3 text-sm font-semibold text-slate-700">
+          {t("panel.mapFile")}
+        </h2>
         <div
           role="button"
           tabIndex={0}
@@ -164,11 +166,11 @@ export default function ControlPanel({
           }`}
         >
           <span className="text-2xl">📄</span>
-          <span className="text-sm text-slate-500">
-            点击选择或拖拽 CSV 地图文件
-          </span>
+          <span className="text-sm text-slate-500">{t("panel.dropHint")}</span>
           <span className="text-xs text-slate-400">
-            {file ? `已选择：${file.name}` : "未选择文件"}
+            {file
+              ? `${t("panel.selectedPrefix")}${file.name}`
+              : t("panel.noFile")}
           </span>
         </div>
         <input
@@ -184,7 +186,7 @@ export default function ControlPanel({
           disabled={busy || !file}
           className="mt-4 h-10 w-full rounded-lg bg-blue-600 text-sm font-medium text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {running ? "算法运行中…" : "运行算法"}
+          {running ? t("panel.running") : t("panel.run")}
         </button>
         <button
           type="button"
@@ -192,15 +194,15 @@ export default function ControlPanel({
           disabled={busy}
           className="mt-2 h-9 w-full rounded-lg border border-slate-200 text-sm text-slate-500 transition hover:bg-slate-50 disabled:opacity-50"
         >
-          载入示例数据（无需后端）
+          {t("panel.loadDemo")}
         </button>
       </section>
 
-      {/* 错误信息 */}
+      {/* 错误信息（后端 errors 原文展示，不做翻译） */}
       {errors.length > 0 && (
         <section className="rounded-xl border border-red-200 bg-red-50 p-3">
           <h3 className="mb-1 text-sm font-semibold text-red-600">
-            出错了（{errors.length}）
+            {t("errors.title", { n: errors.length })}
           </h3>
           <ul className="list-inside list-disc text-xs text-red-500">
             {errors.map((err, i) => (
