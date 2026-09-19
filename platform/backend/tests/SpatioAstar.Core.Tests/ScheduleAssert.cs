@@ -89,5 +89,29 @@ public static class ScheduleAssert
                 }
             }
         }
+
+        // 携带状态：取货帧至卸货帧（含两端）携带该货物；任一 AGV 在窗口外必须为空载（-1），
+        // 且同一时刻最多携带 1 件货物
+        var windows = r.Cargos.Select(c =>
+        {
+            var pickup = r.Events.Single(e => e.Type == ScheduleEventType.Pickup && e.Cargo == c.Id);
+            var drop = r.Events.Single(e => e.Type == ScheduleEventType.Drop && e.Cargo == c.Id);
+            return (Agv: pickup.Agv, Cargo: c.Id, From: pickup.T, To: drop.T);
+        }).ToList();
+
+        for (var t = 0; t <= r.Stats.Makespan; t++)
+        {
+            foreach (var s in r.Frames[t].States)
+            {
+                var active = windows.Where(w => w.Agv == s.Agv && w.From <= t && t <= w.To).ToList();
+                if (s.Carrying == -1)
+                    Assert.Empty(active);
+                else
+                {
+                    var window = Assert.Single(active);
+                    Assert.Equal(window.Cargo, s.Carrying);
+                }
+            }
+        }
     }
 }

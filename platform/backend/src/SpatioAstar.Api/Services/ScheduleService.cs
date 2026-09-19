@@ -44,7 +44,15 @@ public sealed class ScheduleService
         if (errors.Count > 0)
             throw new ScheduleServiceException(errors);
 
-        return Scheduler.Schedule(map);
+        try
+        {
+            return Scheduler.Schedule(map);
+        }
+        catch (SchedulerException ex)
+        {
+            // 调度求解失败也属于用户输入（地图）层面的失败，统一转为 400 + errors
+            throw new ScheduleServiceException(ex.Message);
+        }
     }
 }
 

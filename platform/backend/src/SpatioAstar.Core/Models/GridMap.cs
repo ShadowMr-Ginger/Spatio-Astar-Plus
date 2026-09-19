@@ -15,7 +15,7 @@ public sealed class GridMap
     public GridMap(int width, int height, int[,] grid)
     {
         if (width < 1 || height < 1)
-            throw new ArgumentOutOfRangeException(nameof(grid), "地图宽高必须为正数");
+            throw new ArgumentOutOfRangeException(nameof(width), "地图宽高必须为正数");
         if (grid.GetLength(0) != height || grid.GetLength(1) != width)
             throw new ArgumentException("网格维度与指定的宽高不一致", nameof(grid));
         Width = width;

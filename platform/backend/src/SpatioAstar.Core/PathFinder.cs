@@ -205,7 +205,6 @@ public static class PathFinder
         var parent = new Dictionary<(int X, int Y, int T), (int X, int Y, int T)>();
         var seq = 0;
         var expansions = 0;
-        var findSw = System.Diagnostics.Stopwatch.StartNew();
 
         var start = (X: startX, Y: startY, T: startT);
         gScore[start] = startT;
@@ -215,11 +214,7 @@ public static class PathFinder
         {
             var cur = open.Dequeue();
             if (cur.X == goalX && cur.Y == goalY)
-            {
-                TotalFinds++; TotalExpansions += expansions;
-                if (findSw.ElapsedMilliseconds > SlowestFindMs) { SlowestFindMs = findSw.ElapsedMilliseconds; PeakExpansions = expansions; }
                 return Reconstruct(cur, parent, agvId, startT);
-            }
 
             var nextT = cur.T + 1;
             if (nextT > timeLimit)
@@ -251,17 +246,9 @@ public static class PathFinder
                 TryEnqueue(open, gScore, parent, ref seq, cur, cur.X, cur.Y, nextT, goalX, goalY);
         }
 
-        TotalFinds++; TotalExpansions += expansions;
-        if (findSw.ElapsedMilliseconds > SlowestFindMs) { SlowestFindMs = findSw.ElapsedMilliseconds; PeakExpansions = expansions; }
         throw new SchedulerException(
             $"AGV {agvId} 路径规划失败：无法在时间上限内从 ({startX},{startY}) 到达 ({goalX},{goalY})，请检查地图或降低节点密度");
     }
-
-    // 诊断计数（临时）
-    public static long TotalFinds;
-    public static long TotalExpansions;
-    public static long SlowestFindMs;
-    public static long PeakExpansions;
 
     /// <summary>单条路径搜索的最大扩展次数（防卡死的规模保护）。</summary>
     private const int MaxExpansions = 500_000;
