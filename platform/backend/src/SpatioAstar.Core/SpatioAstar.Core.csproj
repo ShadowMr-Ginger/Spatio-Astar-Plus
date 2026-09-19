@@ -1,9 +1,14 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 允许测试程序集调用 internal 的策略对比入口（Scheduler.Schedule(map, strategy, ...)） -->
+    <InternalsVisibleTo Include="SpatioAstar.Core.Tests" />
+  </ItemGroup>
 
 </Project>

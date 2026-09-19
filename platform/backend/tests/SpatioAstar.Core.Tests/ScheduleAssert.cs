@@ -11,6 +11,7 @@ public static class ScheduleAssert
     {
         // 帧序列：从 t=0 到 t=makespan 连续编号，数量恰为 makespan+1
         Assert.True(r.Stats.Makespan > 0);
+        Assert.True(r.Stats.ElapsedMs >= 0);
         Assert.Equal(r.Stats.Makespan, r.Frames[^1].T);
         Assert.Equal(r.Stats.Makespan + 1, r.Frames.Count);
         for (var t = 0; t <= r.Stats.Makespan; t++)

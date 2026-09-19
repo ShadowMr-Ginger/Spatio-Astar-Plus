@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using SpatioAstar.Core.Models;
 
 namespace SpatioAstar.Core;
@@ -199,51 +200,62 @@ public static class PathFinder
             throw new SchedulerException(
                 $"AGV {agvId} 路径规划失败：目标 ({goalX},{goalY}) 在时间上限内均被占用");
 
-        // 开放列表：(f = g + h, 入队序号, 状态)。序号保证出队顺序确定。
-        var open = new PriorityQueue<(int X, int Y, int T), (int F, int Seq)>();
-        var gScore = new Dictionary<(int X, int Y, int T), int>();
-        var parent = new Dictionary<(int X, int Y, int T), (int X, int Y, int T)>();
+        // 时空状态编码为单个 int：id = (t * height + y) * width + x。
+        // 比 (x,y,t) 元组字典快数倍——稠密地图的深等待搜索依赖这个常数因子。
+        // 每条边的代价恒为 1，因此状态的 g 值恒等于其 t，记录父指针即完成访问标记。
+        var width = map.Width;
+        var height = map.Height;
+        var tStride = width * height;
+        int Encode(int x, int y, int t) => t * tStride + y * width + x;
+        var open = new PriorityQueue<int, (int F, int Seq)>();
+        var parent = new Dictionary<int, int>(1 << 16);
         var seq = 0;
         var expansions = 0;
+        var findSw = Stopwatch.StartNew();
 
-        var start = (X: startX, Y: startY, T: startT);
-        gScore[start] = startT;
-        open.Enqueue(start, (startT + Heuristic(startX, startY, goalX, goalY), seq++));
+        var startId = Encode(startX, startY, startT);
+        parent[startId] = -1;
+        open.Enqueue(startId, (startT + Heuristic(startX, startY, goalX, goalY), seq++));
 
         while (open.Count > 0)
         {
-            var cur = open.Dequeue();
-            if (cur.X == goalX && cur.Y == goalY)
-                return Reconstruct(cur, parent, agvId, startT);
+            var curId = open.Dequeue();
+            var curX = curId % width;
+            var curY = curId / width % height;
+            var curT = curId / tStride;
+            if (curX == goalX && curY == goalY)
+                return Reconstruct(curId, parent, agvId, startT, width, height);
 
-            var nextT = cur.T + 1;
+            var nextT = curT + 1;
             if (nextT > timeLimit)
                 continue; // 超出时间上限的扩展直接丢弃，队列耗尽时统一报失败
 
             // 搜索规模保护：为证明"不可行"而穷举超大时空状态空间代价极高，
-            // 超过阈值后快速失败，交由上层的候选回退/顺序重试处理
-            if (++expansions > MaxExpansions)
+            // 超过阈值后快速失败，交由上层的候选回退/顺序重试处理。
+            // 双保险：扩展次数上限 + 单条搜索的墙钟上限（时间上限内也可能因
+            // 时间维约束导致近乎穷举，二者任一触发即放弃本条搜索）。
+            if (++expansions > MaxExpansions || findSw.Elapsed > MaxFindTime)
                 break;
 
             // 四方向移动
             foreach (var (dx, dy) in Directions)
             {
-                var nx = cur.X + dx;
-                var ny = cur.Y + dy;
+                var nx = curX + dx;
+                var ny = curY + dy;
                 if (!map.IsWalkable(nx, ny))
                     continue;
                 // 顶点冲突：目标格在 nextT 被占用（含静止预留与待定起点）
                 if (!table.IsVertexFree(nx, ny, nextT, agvId))
                     continue;
                 // 边冲突：与他人 nextT-1→nextT 的移动互换位置
-                if (!table.IsEdgeFree(cur.X, cur.Y, nx, ny, nextT, agvId))
+                if (!table.IsEdgeFree(curX, curY, nx, ny, nextT, agvId))
                     continue;
-                TryEnqueue(open, gScore, parent, ref seq, cur, nx, ny, nextT, goalX, goalY);
+                TryEnqueue(open, parent, ref seq, curId, nx, ny, nextT, goalX, goalY, width, height);
             }
 
             // 原地等待（等待也可能冲突：他人可能移动到当前格）
-            if (table.IsVertexFree(cur.X, cur.Y, nextT, agvId))
-                TryEnqueue(open, gScore, parent, ref seq, cur, cur.X, cur.Y, nextT, goalX, goalY);
+            if (table.IsVertexFree(curX, curY, nextT, agvId))
+                TryEnqueue(open, parent, ref seq, curId, curX, curY, nextT, goalX, goalY, width, height);
         }
 
         throw new SchedulerException(
@@ -251,42 +263,43 @@ public static class PathFinder
     }
 
     /// <summary>单条路径搜索的最大扩展次数（防卡死的规模保护）。</summary>
-    private const int MaxExpansions = 500_000;
+    private const int MaxExpansions = 2_000_000;
+
+    /// <summary>单条路径搜索的墙钟时间上限：时间维约束可能让不可行搜索近乎穷举，用它兜底快速失败。</summary>
+    private static readonly TimeSpan MaxFindTime = TimeSpan.FromSeconds(2);
 
     private static void TryEnqueue(
-        PriorityQueue<(int X, int Y, int T), (int F, int Seq)> open,
-        Dictionary<(int X, int Y, int T), int> gScore,
-        Dictionary<(int X, int Y, int T), (int X, int Y, int T)> parent,
+        PriorityQueue<int, (int F, int Seq)> open,
+        Dictionary<int, int> parent,
         ref int seq,
-        (int X, int Y, int T) cur,
+        int curId,
         int nx,
         int ny,
         int nextT,
         int goalX,
-        int goalY)
+        int goalY,
+        int width,
+        int height)
     {
-        var next = (X: nx, Y: ny, T: nextT);
-        if (gScore.TryGetValue(next, out var known) && known <= nextT)
-            return; // 已以更早的到达时刻访问过同一时空状态
+        var nextId = nextT * width * height + ny * width + nx;
+        if (parent.ContainsKey(nextId))
+            return; // 该时空状态已访问（g 恒等于 t，首次到达即最优）
 
-        gScore[next] = nextT;
-        parent[next] = cur;
-        open.Enqueue(next, (nextT + Heuristic(nx, ny, goalX, goalY), seq++));
+        parent[nextId] = curId;
+        open.Enqueue(nextId, (nextT + Heuristic(nx, ny, goalX, goalY), seq++));
     }
 
     private static PlannedPath Reconstruct(
-        (int X, int Y, int T) goal,
-        Dictionary<(int X, int Y, int T), (int X, int Y, int T)> parent,
+        int goalId,
+        Dictionary<int, int> parent,
         int agvId,
-        int startT)
+        int startT,
+        int width,
+        int height)
     {
-        var states = new List<(int X, int Y, int T)>();
-        for (var cur = goal; ; cur = parent[cur])
-        {
-            states.Add(cur);
-            if (cur.T == startT)
-                break;
-        }
+        var states = new List<(int X, int Y)>();
+        for (var cur = goalId; cur != -1; cur = parent[cur])
+            states.Add((cur % width, cur / width % height));
 
         states.Reverse();
         var steps = new List<PathStep>(states.Count);

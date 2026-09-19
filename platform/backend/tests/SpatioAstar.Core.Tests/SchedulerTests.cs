@@ -129,4 +129,96 @@ public sealed class SchedulerTests
             sw.Elapsed < TimeSpan.FromSeconds(10),
             $"调度耗时 {sw.Elapsed.TotalSeconds:F1} 秒，超过 10 秒上限");
     }
+
+    /// <summary>
+    /// 负载均衡场景：货物集中在一角、1 台 AGV 离货物群很远（静态配额下它仍要独自跑长途）。
+    /// 动态分配让近处 AGV 多劳、远处 AGV 只并行帮工，makespan 不得劣于静态配额。
+    /// </summary>
+    [Fact]
+    public void Schedule_UnbalancedMap_DynamicNoWorseThanQuota()
+    {
+        // 港口与 8 件货物挤在左上 5x3 区域；AGV(1,2)、(4,2) 就在旁边，AGV(14,6) 在右下角
+        const string csv = """
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+            0,4,0,2,2,2,0,0,0,0,0,0,0,0,0
+            0,3,0,2,3,2,0,0,0,0,0,0,0,0,0
+            0,0,0,2,2,2,0,0,0,0,0,0,0,0,0
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,3
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+            """;
+        var map = MapParser.Parse(csv);
+        var dynamicResult = Scheduler.Schedule(map, AssignmentStrategy.DynamicNearest);
+        var quotaResult = Scheduler.Schedule(map, AssignmentStrategy.StaticQuota);
+
+        ScheduleAssert.Valid(dynamicResult);
+        ScheduleAssert.Valid(quotaResult);
+        Assert.True(
+            dynamicResult.Stats.Makespan <= quotaResult.Stats.Makespan,
+            $"动态分配 makespan {dynamicResult.Stats.Makespan} 应不劣于静态配额 {quotaResult.Stats.Makespan}");
+    }
+
+    /// <summary>动态分配的行为特征：货物分完之前不存在"AGV 完成任务后长期闲置"——
+    /// 每台被用过 AGV 的最后一次作业时间应紧贴 makespan（静态配额则允许近处 AGV 早早退休）。</summary>
+    [Fact]
+    public void Schedule_UnbalancedMap_DynamicKeepsAgvsBusy()
+    {
+        const string csv = """
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+            0,4,0,2,2,2,0,0,0,0,0,0,0,0,0
+            0,3,0,2,3,2,0,0,0,0,0,0,0,0,0
+            0,0,0,2,2,2,0,0,0,0,0,0,0,0,0
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,3
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+            """;
+        var result = Scheduler.Schedule(MapParser.Parse(csv), AssignmentStrategy.DynamicNearest);
+        ScheduleAssert.Valid(result);
+
+        // 每台 AGV 的"退休时间"= 最后一帧非 wait 动作的时刻（返场移动也算作业）。
+        // 动态分配下所有 AGV 应在几乎同一时刻收尾，最大退休时差不超过 1 趟近途往返。
+        var retireTimes = result.Agvs.Select(a =>
+        {
+            for (var t = result.Stats.Makespan; t >= 0; t--)
+            {
+                var s = result.Frames[t].States.Single(x => x.Agv == a.Id);
+                if (s.Action != AgvAction.Wait)
+                    return t;
+            }
+            return 0;
+        }).ToList();
+
+        var spread = retireTimes.Max() - retireTimes.Min();
+        Assert.True(
+            spread <= 20,
+            $"动态分配下 AGV 退休时间差 {spread} 过大（{string.Join(",", retireTimes)}），存在提前闲置");
+    }
+
+    /// <summary>默认组合入口应在两种策略、多种优先顺序的全部结果中择优，且不劣于任一单独策略。</summary>
+    [Fact]
+    public void Schedule_DefaultPicksBestAcrossStrategies()
+    {
+        // 与 DynamicNoWorseThanQuota 同一的不均衡地图（确定性）
+        const string csv = """
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+            0,4,0,2,2,2,0,0,0,0,0,0,0,0,0
+            0,3,0,2,3,2,0,0,0,0,0,0,0,0,0
+            0,0,0,2,2,2,0,0,0,0,0,0,0,0,0
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,3
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+            """;
+        var map = MapParser.Parse(csv);
+        var combined = Scheduler.Schedule(map);
+        var dynamicResult = Scheduler.Schedule(map, AssignmentStrategy.DynamicNearest);
+        var quotaResult = Scheduler.Schedule(map, AssignmentStrategy.StaticQuota);
+
+        ScheduleAssert.Valid(combined);
+        Assert.True(combined.Stats.Makespan <= dynamicResult.Stats.Makespan);
+        Assert.True(combined.Stats.Makespan <= quotaResult.Stats.Makespan);
+        Assert.True(combined.Stats.ElapsedMs >= 0);
+    }
 }
