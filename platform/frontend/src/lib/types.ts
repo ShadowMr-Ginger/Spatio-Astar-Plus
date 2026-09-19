@@ -92,3 +92,16 @@ export interface LoadedMapInfo {
   cargoCount: number;
   portCount: number;
 }
+
+/** GET /api/schedules/estimate 的查询参数 */
+export interface EstimateParams {
+  cargoCount: number;
+  openCount: number;
+  agvCount: number;
+}
+
+/** GET /api/schedules/estimate 的返回：求解耗时预估区间（ms） */
+export interface EstimateResult {
+  minMs: number;
+  maxMs: number;
+}

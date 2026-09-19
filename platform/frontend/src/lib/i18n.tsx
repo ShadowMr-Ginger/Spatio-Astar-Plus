@@ -36,6 +36,11 @@ const zh = {
   "panel.running": "算法运行中…",
   "panel.loadDemo": "载入示例数据（无需后端）",
 
+  "run.elapsed": "已运行 {v} s",
+  "run.estimate": "预估 {min}~{max} s",
+  "run.timeoutWarning":
+    "该地图求解可能超出响应时间限制（>40s），可能超时失败，建议减少货物数量或增大地图",
+
   "errors.title": "出错了（{n}）",
 
   "canvas.animating": "调度动画",
@@ -130,6 +135,11 @@ const en: Record<TKey, string> = {
   "panel.run": "Run algorithm",
   "panel.running": "Running algorithm…",
   "panel.loadDemo": "Load demo data (no backend needed)",
+
+  "run.elapsed": "Elapsed {v} s",
+  "run.estimate": "Estimated {min}~{max} s",
+  "run.timeoutWarning":
+    "This map may exceed the response time limit (>40s) and fail. Consider fewer cargos or a larger map.",
 
   "errors.title": "Errors ({n})",
 

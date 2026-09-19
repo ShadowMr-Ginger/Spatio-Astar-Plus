@@ -4,7 +4,7 @@
 // 播放时钟按子步推进：子步索引 = t*3 + k（k ∈ {0,1,2}），逻辑帧时长基准 250ms
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import ControlPanel from "@/components/ControlPanel";
 import MapCanvas from "@/components/MapCanvas";
 import PlayerControls from "@/components/PlayerControls";
@@ -12,6 +12,7 @@ import { useI18n } from "@/lib/i18n";
 import {
   ApiError,
   downloadBlob,
+  fetchEstimate,
   generateMapCsv,
   runSchedule,
   scheduleToCsv,
@@ -19,7 +20,13 @@ import {
 import { getMockSchedule } from "@/lib/mock";
 import { csvToFile, gridToCsv, parseMapCsv } from "@/lib/mapCsv";
 import { frameOf, maxSubStep, phaseOf, SUBSTEPS_PER_FRAME } from "@/lib/render";
-import type { LoadedMapInfo, MapGenParams, ScheduleResult } from "@/lib/types";
+import type {
+  EstimateResult,
+  LoadedMapInfo,
+  MapGenParams,
+  ScheduleResult,
+} from "@/lib/types";
+import type { ParsedMap } from "@/lib/mapCsv";
 
 // 地图生成参数的默认值
 const DEFAULT_PARAMS: MapGenParams = {
@@ -31,12 +38,14 @@ const DEFAULT_PARAMS: MapGenParams = {
   obstacleRatio: 0.25,
 };
 
-// 当前已载入的地图：预览数据 + 用于上传后端的 File + 面板展示信息
+// 当前已载入的地图：预览数据 + 用于上传后端的 File + 面板展示信息 + 耗时预估
 interface LoadedMap {
   name: string;
   file: File;
   preview: { width: number; height: number; grid: number[][] };
   info: LoadedMapInfo;
+  /** 求解耗时预估（ms）；estimate 接口失败或未返回时为 null（静默降级） */
+  estimate: EstimateResult | null;
 }
 
 // 基础帧率：1x 速度下逻辑帧时长 250ms，拆 3 子步后每子步 ≈ 83ms
@@ -70,6 +79,9 @@ export default function Home() {
   const [running, setRunning] = useState(false);
   const [errors, setErrors] = useState<string[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
+  /** 运行计时（ms）：点击运行后开始计时，响应返回后停止并保留最终值 */
+  const [elapsedMs, setElapsedMs] = useState<number | null>(null);
+  const elapsedTimerRef = useRef<number | null>(null);
 
   const totalFrames = result?.frames.length ?? 0;
   const maxSub = maxSubStep(totalFrames);
@@ -81,18 +93,65 @@ export default function Home() {
       ? "地图文件格式不正确：应为逗号分隔的 0-4 数字网格"
       : "Invalid map file: expected a comma-separated grid of digits 0-4";
 
+  const stopElapsedTimer = useCallback(() => {
+    if (elapsedTimerRef.current != null) {
+      window.clearInterval(elapsedTimerRef.current);
+      elapsedTimerRef.current = null;
+    }
+  }, []);
+
+  /** 开始运行计时：每 100ms 刷新一次，直到 stopElapsedTimer */
+  const startElapsedTimer = useCallback(() => {
+    stopElapsedTimer();
+    const t0 = Date.now();
+    setElapsedMs(0);
+    elapsedTimerRef.current = window.setInterval(
+      () => setElapsedMs(Date.now() - t0),
+      100
+    );
+  }, [stopElapsedTimer]);
+
+  // 组件卸载时清理计时器
+  useEffect(() => stopElapsedTimer, [stopElapsedTimer]);
+
+  /**
+   * 按地图统计信息请求求解耗时预估，并写入对应地图状态。
+   * estimate 接口失败（400/网络）时静默降级为 null（不显示预估与警告）。
+   */
+  const applyEstimate = useCallback(
+    (target: LoadedMap, parsed: ParsedMap) => {
+      fetchEstimate({
+        cargoCount: parsed.cargoCount,
+        openCount: parsed.openCount,
+        agvCount: parsed.agvCount,
+      })
+        .then((estimate) => {
+          setMap((prev) =>
+            prev && prev.file === target.file ? { ...prev, estimate } : prev
+          );
+        })
+        .catch(() => {
+          /* 静默降级：不显示预估与超时警告 */
+        });
+    },
+    []
+  );
+
   /** 选择文件后解析 CSV 并载入为当前地图 */
   const handleFileChange = useCallback(
     async (f: File | null) => {
       setErrors([]);
       setNotice(null);
+      setResult(null);
+      setElapsedMs(null);
+      stopElapsedTimer();
       if (!f) {
         setMap(null);
         return;
       }
       try {
         const parsed = parseMapCsv(await f.text());
-        setMap({
+        const loaded: LoadedMap = {
           name: f.name,
           file: f,
           preview: {
@@ -108,13 +167,16 @@ export default function Home() {
             cargoCount: parsed.cargoCount,
             portCount: parsed.portCount,
           },
-        });
+          estimate: null,
+        };
+        setMap(loaded);
+        applyEstimate(loaded, parsed);
       } catch {
         setMap(null);
         setErrors([invalidFileMsg]);
       }
     },
-    [invalidFileMsg]
+    [invalidFileMsg, applyEstimate, stopElapsedTimer]
   );
 
   /**
@@ -129,7 +191,7 @@ export default function Home() {
       const csv = await generateMapCsv(params);
       // 解析并自动载入
       const parsed = parseMapCsv(csv);
-      setMap({
+      const loaded: LoadedMap = {
         name: "map.csv",
         file: csvToFile(csv, "map.csv"),
         preview: {
@@ -145,11 +207,16 @@ export default function Home() {
           cargoCount: parsed.cargoCount,
           portCount: parsed.portCount,
         },
-      });
+        estimate: null,
+      };
+      setMap(loaded);
       setResult(null);
       setSubIdx(0);
       setPlaying(false);
+      setElapsedMs(null);
+      stopElapsedTimer();
       setNotice(t("panel.mapLoaded"));
+      applyEstimate(loaded, parsed);
     } catch (e) {
       setErrors(
         e instanceof ApiError
@@ -163,7 +230,7 @@ export default function Home() {
     } finally {
       setGenerating(false);
     }
-  }, [params, lang, t]);
+  }, [params, lang, t, applyEstimate, stopElapsedTimer]);
 
   /** 上传当前载入的地图并运行调度算法 */
   const handleRun = useCallback(async () => {
@@ -172,6 +239,7 @@ export default function Home() {
     setPlaying(false);
     setErrors([]);
     setNotice(null);
+    startElapsedTimer();
     try {
       const data = await runSchedule(map.file);
       setResult(data);
@@ -187,9 +255,10 @@ export default function Home() {
             ]
       );
     } finally {
+      stopElapsedTimer();
       setRunning(false);
     }
-  }, [map, lang]);
+  }, [map, lang, startElapsedTimer, stopElapsedTimer]);
 
   /** 下载当前已载入地图为 map.csv（File 由 mapCsv 序列化逻辑生成） */
   const handleDownloadMap = useCallback(() => {
@@ -203,7 +272,7 @@ export default function Home() {
     // 由示例网格序列化出真实 File，示例地图也可直接「运行算法」
     const csv = gridToCsv(demo.grid);
     const parsed = parseMapCsv(csv);
-    setMap({
+    const loaded: LoadedMap = {
       name: "demo.csv",
       file: csvToFile(csv, "demo.csv"),
       preview: { width: demo.width, height: demo.height, grid: demo.grid },
@@ -215,13 +284,18 @@ export default function Home() {
         cargoCount: parsed.cargoCount,
         portCount: parsed.portCount,
       },
-    });
+      estimate: null,
+    };
+    setMap(loaded);
     setResult(demo);
     setSubIdx(0);
     setPlaying(false);
+    setElapsedMs(null);
+    stopElapsedTimer();
     setErrors([]);
     setNotice(null);
-  }, []);
+    applyEstimate(loaded, parsed);
+  }, [applyEstimate, stopElapsedTimer]);
 
   // 播放驱动：按子步推进（1x 时子步间隔 ≈ 250/3 ms），播完自动停止
   useEffect(() => {
@@ -333,6 +407,11 @@ export default function Home() {
             onFileChange={handleFileChange}
             running={running}
             onRun={handleRun}
+            elapsedMs={elapsedMs}
+            estimate={map?.estimate ?? null}
+            timeoutWarning={Boolean(
+              map?.estimate && map.estimate.maxMs > 40000 && !result
+            )}
             perf={
               result
                 ? {

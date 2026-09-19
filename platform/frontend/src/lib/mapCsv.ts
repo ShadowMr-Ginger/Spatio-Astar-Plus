@@ -9,6 +9,8 @@ export interface ParsedMap {
   agvCount: number;
   cargoCount: number;
   portCount: number;
+  /** 可通行格子数（值 0/2/3/4，即非障碍） */
+  openCount: number;
 }
 
 /**
@@ -34,14 +36,17 @@ export function parseMapCsv(text: string): ParsedMap {
   let agvCount = 0;
   let cargoCount = 0;
   let portCount = 0;
+  let openCount = 0;
   for (const row of grid) {
     for (const v of row) {
+      if (v === 1) continue;
+      openCount++;
       if (v === 2) cargoCount++;
       else if (v === 3) agvCount++;
       else if (v === 4) portCount++;
     }
   }
-  return { width: grid[0].length, height: grid.length, grid, agvCount, cargoCount, portCount };
+  return { width: grid[0].length, height: grid.length, grid, agvCount, cargoCount, portCount, openCount };
 }
 
 /** 网格序列化为 CSV 文本（行尾 \n，无表头） */

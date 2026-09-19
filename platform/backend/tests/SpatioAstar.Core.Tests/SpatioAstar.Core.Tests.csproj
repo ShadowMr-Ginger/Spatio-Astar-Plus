@@ -22,6 +22,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\SpatioAstar.Core\SpatioAstar.Core.csproj" />
+    <ProjectReference Include="..\..\src\SpatioAstar.Api\SpatioAstar.Api.csproj" />
   </ItemGroup>
 
 </Project>

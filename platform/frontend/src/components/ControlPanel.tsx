@@ -4,7 +4,7 @@
 
 import { useRef, useState } from "react";
 import { useI18n } from "@/lib/i18n";
-import type { LoadedMapInfo, MapGenParams } from "@/lib/types";
+import type { EstimateResult, LoadedMapInfo, MapGenParams } from "@/lib/types";
 
 /** 性能区块展示的数据（运行算法后填入，未运行时各项显示 "—"） */
 export interface PerfSummary {
@@ -26,6 +26,12 @@ interface ControlPanelProps {
   onFileChange: (file: File | null) => void;
   running: boolean;
   onRun: () => void;
+  /** 本次/上次运行计时（ms），null 表示尚未运行；运行中每 100ms 刷新，结束后保留最终值 */
+  elapsedMs: number | null;
+  /** 当前地图的求解耗时预估（ms）；接口失败为 null，静默降级不显示预估 */
+  estimate: EstimateResult | null;
+  /** 预估上限超过 40s 时显示超时警告条 */
+  timeoutWarning: boolean;
   /** 算法运行结果的性能数据，null 表示尚未运行 */
   perf: PerfSummary | null;
   /** 下载当前已载入地图为 map.csv */
@@ -72,6 +78,11 @@ function NumberField({
   );
 }
 
+/** 秒数格式化：向上取整到 0.1s 精度，保留 1 位小数 */
+function formatSeconds(ms: number): string {
+  return (Math.ceil(ms / 100) / 10).toFixed(1);
+}
+
 function PerfItem({ label, value }: { label: string; value: string | number }) {
   return (
     <div className="flex items-baseline justify-between gap-2">
@@ -92,6 +103,9 @@ export default function ControlPanel({
   onFileChange,
   running,
   onRun,
+  elapsedMs,
+  estimate,
+  timeoutWarning,
   perf,
   onDownloadMap,
   errors,
@@ -251,6 +265,31 @@ export default function ControlPanel({
         >
           {running ? t("panel.running") : t("panel.run")}
         </button>
+
+        {/* 预估耗时超阈值警告（>40s） */}
+        {timeoutWarning && (
+          <div className="mt-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-xs font-medium text-amber-700">
+            {t("run.timeoutWarning")}
+          </div>
+        )}
+
+        {/* 运行计时 + 预估（运行中显示预估，结束后计时保留最终值） */}
+        {(elapsedMs != null || (running && estimate)) && (
+          <div className="mt-3 flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-600">
+            <span>
+              {elapsedMs != null &&
+                t("run.elapsed", { v: formatSeconds(elapsedMs) })}
+            </span>
+            {running && estimate && (
+              <span>
+                {t("run.estimate", {
+                  min: formatSeconds(estimate.minMs),
+                  max: formatSeconds(estimate.maxMs),
+                })}
+              </span>
+            )}
+          </div>
+        )}
 
         {/* 性能展示：运行算法后填入实际数据，未运行时显示 "—" */}
         <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">

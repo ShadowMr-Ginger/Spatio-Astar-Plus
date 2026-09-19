@@ -1,6 +1,11 @@
 // 统一封装对后端 API 的调用（通过 next.config 中的 rewrite 代理到 localhost:5080）
 
-import type { MapGenParams, ScheduleResult } from "./types";
+import type {
+  EstimateParams,
+  EstimateResult,
+  MapGenParams,
+  ScheduleResult,
+} from "./types";
 
 /** 后端返回的错误格式：{ "errors": ["..."] } */
 export class ApiError extends Error {
@@ -50,6 +55,20 @@ export async function generateMapCsv(params: MapGenParams): Promise<string> {
   const res = await fetch(`/api/maps/generate?${qs.toString()}`);
   if (!res.ok) throw await parseError(res);
   return res.text();
+}
+
+/** GET /api/schedules/estimate —— 预估求解耗时区间（ms）；失败抛 ApiError，调用方可静默降级 */
+export async function fetchEstimate(
+  params: EstimateParams
+): Promise<EstimateResult> {
+  const qs = new URLSearchParams({
+    cargoCount: String(params.cargoCount),
+    openCount: String(params.openCount),
+    agvCount: String(params.agvCount),
+  });
+  const res = await fetch(`/api/schedules/estimate?${qs.toString()}`);
+  if (!res.ok) throw await parseError(res);
+  return (await res.json()) as EstimateResult;
 }
 
 /** POST /api/schedules/run —— 上传 csv 地图并运行调度算法 */
