@@ -1,0 +1,6 @@
+@SpatioAstar.Api_HostAddress = http://localhost:5047
+
+GET {{SpatioAstar.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

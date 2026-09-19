@@ -1,0 +1,15 @@
+# .NET build output
+bin/
+obj/
+out/
+
+# Visual Studio / Rider
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Test & tooling artifacts
+TestResults/
+*.trx
