@@ -37,8 +37,8 @@ export function downloadBlob(blob: Blob, filename: string): void {
   URL.revokeObjectURL(url);
 }
 
-/** GET /api/maps/generate —— 生成随机地图并自动下载为 map.csv */
-export async function generateMapCsv(params: MapGenParams): Promise<void> {
+/** GET /api/maps/generate —— 生成随机地图，返回 CSV 文本（调用方负责下载与载入） */
+export async function generateMapCsv(params: MapGenParams): Promise<string> {
   const qs = new URLSearchParams({
     width: String(params.width),
     height: String(params.height),
@@ -49,8 +49,7 @@ export async function generateMapCsv(params: MapGenParams): Promise<void> {
   });
   const res = await fetch(`/api/maps/generate?${qs.toString()}`);
   if (!res.ok) throw await parseError(res);
-  const blob = await res.blob();
-  downloadBlob(blob, "map.csv");
+  return res.text();
 }
 
 /** POST /api/schedules/run —— 上传 csv 地图并运行调度算法 */

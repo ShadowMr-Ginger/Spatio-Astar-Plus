@@ -3,6 +3,7 @@
 // 主页面：左侧控制面板 + 右侧地图动画 / 播放器 / 统计 / 导出
 // 播放时钟按子步推进：子步索引 = t*3 + k（k ∈ {0,1,2}），逻辑帧时长基准 250ms
 
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import ControlPanel from "@/components/ControlPanel";
 import MapCanvas from "@/components/MapCanvas";
@@ -16,8 +17,9 @@ import {
   scheduleToCsv,
 } from "@/lib/api";
 import { getMockSchedule } from "@/lib/mock";
+import { csvToFile, gridToCsv, parseMapCsv } from "@/lib/mapCsv";
 import { frameOf, maxSubStep, phaseOf, SUBSTEPS_PER_FRAME } from "@/lib/render";
-import type { MapGenParams, ScheduleResult } from "@/lib/types";
+import type { LoadedMapInfo, MapGenParams, ScheduleResult } from "@/lib/types";
 
 // 地图生成参数的默认值
 const DEFAULT_PARAMS: MapGenParams = {
@@ -29,18 +31,23 @@ const DEFAULT_PARAMS: MapGenParams = {
   obstacleRatio: 0.25,
 };
 
-// 上传后、运行前，用于静态预览的地图数据
-interface MapPreview {
-  width: number;
-  height: number;
-  grid: number[][];
+// 当前已载入的地图：预览数据 + 用于上传后端的 File + 面板展示信息
+interface LoadedMap {
+  name: string;
+  file: File;
+  preview: { width: number; height: number; grid: number[][] };
+  info: LoadedMapInfo;
 }
 
 // 基础帧率：1x 速度下逻辑帧时长 250ms，拆 3 子步后每子步 ≈ 83ms
 const BASE_FRAME_MS = 250;
 
 // 图例（颜色与 MapCanvas 内 COLORS 一致，文案走 i18n）
-const LEGEND_ITEMS: Array<{ key: "path" | "obstacle" | "cargo" | "agv" | "agvCarry" | "port"; color: string; stroke?: boolean }> = [
+const LEGEND_ITEMS: Array<{
+  key: "path" | "obstacle" | "cargo" | "agv" | "agvCarry" | "port";
+  color: string;
+  stroke?: boolean;
+}> = [
   { key: "path", color: "#ffffff", stroke: true },
   { key: "obstacle", color: "#475569" },
   { key: "cargo", color: "#f59e0b" },
@@ -52,8 +59,8 @@ const LEGEND_ITEMS: Array<{ key: "path" | "obstacle" | "cargo" | "agv" | "agvCar
 export default function Home() {
   const { lang, setLang, t } = useI18n();
   const [params, setParams] = useState<MapGenParams>(DEFAULT_PARAMS);
-  const [file, setFile] = useState<File | null>(null);
-  const [preview, setPreview] = useState<MapPreview | null>(null);
+  /** 当前已载入地图（上传 / 生成 / 示例数据共用），null 表示未载入 */
+  const [map, setMap] = useState<LoadedMap | null>(null);
   const [result, setResult] = useState<ScheduleResult | null>(null);
   // 播放时钟：子步索引（t*3 + k），进度条/帧计数仍以逻辑帧为单位
   const [subIdx, setSubIdx] = useState(0);
@@ -62,95 +69,158 @@ export default function Home() {
   const [generating, setGenerating] = useState(false);
   const [running, setRunning] = useState(false);
   const [errors, setErrors] = useState<string[]>([]);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const totalFrames = result?.frames.length ?? 0;
   const maxSub = maxSubStep(totalFrames);
   const curT = result ? Math.min(frameOf(subIdx), totalFrames - 1) : 0;
   const phase = result ? phaseOf(subIdx) : 0;
 
-  /** 选择文件后本地解析 CSV，用于运行前的静态地图预览 */
-  const handleFileChange = useCallback(async (f: File | null) => {
-    setFile(f);
-    setErrors([]);
-    if (!f) {
-      setPreview(null);
-      return;
-    }
-    try {
-      const text = await f.text();
-      const grid = text
-        .trim()
-        .split(/\r?\n/)
-        .map((line) => line.split(",").map(Number));
-      const valid =
-        grid.length > 0 &&
-        grid.every(
-          (row) =>
-            row.length === grid[0].length &&
-            row.every((v) => Number.isInteger(v) && v >= 0 && v <= 4)
-        );
-      if (!valid) {
-        setPreview(null);
-        setErrors([
-          lang === "zh"
-            ? "地图文件格式不正确：应为逗号分隔的 0-4 数字网格"
-            : "Invalid map file: expected a comma-separated grid of digits 0-4",
-        ]);
+  const invalidFileMsg =
+    lang === "zh"
+      ? "地图文件格式不正确：应为逗号分隔的 0-4 数字网格"
+      : "Invalid map file: expected a comma-separated grid of digits 0-4";
+
+  /** 选择文件后解析 CSV 并载入为当前地图 */
+  const handleFileChange = useCallback(
+    async (f: File | null) => {
+      setErrors([]);
+      setNotice(null);
+      if (!f) {
+        setMap(null);
         return;
       }
-      setPreview({ width: grid[0].length, height: grid.length, grid });
-    } catch {
-      setPreview(null);
-      setErrors([lang === "zh" ? "读取地图文件失败" : "Failed to read the map file"]);
-    }
-  }, [lang]);
+      try {
+        const parsed = parseMapCsv(await f.text());
+        setMap({
+          name: f.name,
+          file: f,
+          preview: {
+            width: parsed.width,
+            height: parsed.height,
+            grid: parsed.grid,
+          },
+          info: {
+            name: f.name,
+            width: parsed.width,
+            height: parsed.height,
+            agvCount: parsed.agvCount,
+            cargoCount: parsed.cargoCount,
+            portCount: parsed.portCount,
+          },
+        });
+      } catch {
+        setMap(null);
+        setErrors([invalidFileMsg]);
+      }
+    },
+    [invalidFileMsg]
+  );
 
-  /** 生成随机地图并触发下载 */
+  /**
+   * 生成随机地图：解析返回内容并自动载入为当前地图，
+   * 预览立即显示，「运行算法」直接可用（不再自动下载，下载走「下载地图」按钮）
+   */
   const handleGenerate = useCallback(async () => {
     setGenerating(true);
     setErrors([]);
+    setNotice(null);
     try {
-      await generateMapCsv(params);
+      const csv = await generateMapCsv(params);
+      // 解析并自动载入
+      const parsed = parseMapCsv(csv);
+      setMap({
+        name: "map.csv",
+        file: csvToFile(csv, "map.csv"),
+        preview: {
+          width: parsed.width,
+          height: parsed.height,
+          grid: parsed.grid,
+        },
+        info: {
+          name: "map.csv",
+          width: parsed.width,
+          height: parsed.height,
+          agvCount: parsed.agvCount,
+          cargoCount: parsed.cargoCount,
+          portCount: parsed.portCount,
+        },
+      });
+      setResult(null);
+      setSubIdx(0);
+      setPlaying(false);
+      setNotice(t("panel.mapLoaded"));
     } catch (e) {
       setErrors(
         e instanceof ApiError
           ? e.errors
-          : [lang === "zh" ? "生成地图失败，请检查后端服务" : "Failed to generate map; is the backend running?"]
+          : [
+              lang === "zh"
+                ? "生成地图失败，请检查后端服务"
+                : "Failed to generate map; is the backend running?",
+            ]
       );
     } finally {
       setGenerating(false);
     }
-  }, [params, lang]);
+  }, [params, lang, t]);
 
-  /** 上传当前文件并运行调度算法 */
+  /** 上传当前载入的地图并运行调度算法 */
   const handleRun = useCallback(async () => {
-    if (!file) return;
+    if (!map) return;
     setRunning(true);
     setPlaying(false);
     setErrors([]);
+    setNotice(null);
     try {
-      const data = await runSchedule(file);
+      const data = await runSchedule(map.file);
       setResult(data);
       setSubIdx(0);
     } catch (e) {
       setErrors(
         e instanceof ApiError
           ? e.errors
-          : [lang === "zh" ? "算法运行失败，请检查后端服务" : "Algorithm run failed; is the backend running?"]
+          : [
+              lang === "zh"
+                ? "算法运行失败，请检查后端服务"
+                : "Algorithm run failed; is the backend running?",
+            ]
       );
     } finally {
       setRunning(false);
     }
-  }, [file, lang]);
+  }, [map, lang]);
+
+  /** 下载当前已载入地图为 map.csv（File 由 mapCsv 序列化逻辑生成） */
+  const handleDownloadMap = useCallback(() => {
+    if (!map) return;
+    downloadBlob(map.file, "map.csv");
+  }, [map]);
 
   /** 载入本地示例数据（后端未启动时预览界面效果） */
   const handleLoadDemo = useCallback(() => {
     const demo = getMockSchedule();
+    // 由示例网格序列化出真实 File，示例地图也可直接「运行算法」
+    const csv = gridToCsv(demo.grid);
+    const parsed = parseMapCsv(csv);
+    setMap({
+      name: "demo.csv",
+      file: csvToFile(csv, "demo.csv"),
+      preview: { width: demo.width, height: demo.height, grid: demo.grid },
+      info: {
+        name: "demo.csv",
+        width: parsed.width,
+        height: parsed.height,
+        agvCount: parsed.agvCount,
+        cargoCount: parsed.cargoCount,
+        portCount: parsed.portCount,
+      },
+    });
     setResult(demo);
-    setPreview({ width: demo.width, height: demo.height, grid: demo.grid });
     setSubIdx(0);
     setPlaying(false);
     setErrors([]);
+    setNotice(null);
   }, []);
 
   // 播放驱动：按子步推进（1x 时子步间隔 ≈ 250/3 ms），播完自动停止
@@ -185,10 +255,10 @@ export default function Home() {
     setPlaying((p) => !p);
   }, [result, playing, subIdx, maxSub]);
 
-  // Canvas 数据源：运行结果优先，否则用上传文件的静态预览
+  // Canvas 数据源：运行结果优先，否则用已载入地图的静态预览
   const mapData = result
     ? { width: result.width, height: result.height, grid: result.grid }
-    : preview;
+    : map?.preview ?? null;
   const currentFrame = result?.frames[curT] ?? null;
   const nextFrame =
     result && curT < totalFrames - 1 ? result.frames[curT + 1] : null;
@@ -215,30 +285,38 @@ export default function Home() {
 
   return (
     <div className="flex min-h-screen flex-col">
-      {/* 顶部标题栏 + 语言切换 */}
+      {/* 顶部标题栏 + 语言切换 + 规则入口 */}
       <header className="border-b border-slate-200 bg-white shadow-sm">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-6 py-4">
           <div>
             <h1 className="text-xl font-bold text-slate-800">
               {t("app.title")}
             </h1>
             <p className="mt-0.5 text-sm text-slate-500">{t("app.subtitle")}</p>
           </div>
-          <div className="flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 p-1">
-            {(["zh", "en"] as const).map((l) => (
-              <button
-                key={l}
-                type="button"
-                onClick={() => setLang(l)}
-                className={`h-8 rounded-md px-3 text-sm font-medium transition ${
-                  lang === l
-                    ? "bg-indigo-600 text-white shadow-sm"
-                    : "text-slate-500 hover:text-slate-700"
-                }`}
-              >
-                {t(l === "zh" ? "lang.zh" : "lang.en")}
-              </button>
-            ))}
+          <div className="flex items-center gap-2">
+            <Link
+              href="/rules"
+              className="inline-flex h-9 items-center justify-center rounded-lg bg-amber-400 px-3 text-sm font-semibold text-amber-950 shadow-sm transition hover:bg-amber-300 hover:shadow"
+            >
+              {t("rules.open")}
+            </Link>
+            <div className="flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 p-1">
+              {(["zh", "en"] as const).map((l) => (
+                <button
+                  key={l}
+                  type="button"
+                  onClick={() => setLang(l)}
+                  className={`h-8 rounded-md px-3 text-sm font-medium transition ${
+                    lang === l
+                      ? "bg-indigo-600 text-white shadow-sm"
+                      : "text-slate-500 hover:text-slate-700"
+                  }`}
+                >
+                  {t(l === "zh" ? "lang.zh" : "lang.en")}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
       </header>
@@ -251,11 +329,25 @@ export default function Home() {
             onParamsChange={setParams}
             generating={generating}
             onGenerate={handleGenerate}
-            file={file}
+            map={map?.info ?? null}
             onFileChange={handleFileChange}
             running={running}
             onRun={handleRun}
+            perf={
+              result
+                ? {
+                    elapsedMs: result.stats.elapsedMs,
+                    makespan: result.stats.makespan,
+                    totalMoves: result.stats.totalMoves,
+                    deliveries: result.stats.deliveries,
+                    totalCargos: result.cargos.length,
+                    agvCount: result.agvs.length,
+                  }
+                : null
+            }
+            onDownloadMap={handleDownloadMap}
             errors={errors}
+            notice={notice}
             onLoadDemo={handleLoadDemo}
           />
         </aside>

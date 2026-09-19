@@ -56,6 +56,8 @@ export interface ScheduleStats {
   totalMoves: number;
   pickups: number;
   deliveries: number;
+  /** 算法求解耗时（ms）；旧版后端可能缺失 */
+  elapsedMs?: number;
 }
 
 /** POST /api/schedules/run 的完整返回 */
@@ -79,4 +81,14 @@ export interface MapGenParams {
   cargoCount: number;
   portCount: number;
   obstacleRatio: number;
+}
+
+/** 当前已载入地图的信息（展示于控制面板） */
+export interface LoadedMapInfo {
+  name: string;
+  width: number;
+  height: number;
+  agvCount: number;
+  cargoCount: number;
+  portCount: number;
 }

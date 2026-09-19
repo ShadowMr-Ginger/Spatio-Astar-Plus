@@ -4,18 +4,35 @@
 
 import { useRef, useState } from "react";
 import { useI18n } from "@/lib/i18n";
-import type { MapGenParams } from "@/lib/types";
+import type { LoadedMapInfo, MapGenParams } from "@/lib/types";
+
+/** 性能区块展示的数据（运行算法后填入，未运行时各项显示 "—"） */
+export interface PerfSummary {
+  elapsedMs?: number;
+  makespan?: number;
+  totalMoves?: number;
+  deliveries?: number;
+  totalCargos?: number;
+  agvCount?: number;
+}
 
 interface ControlPanelProps {
   params: MapGenParams;
   onParamsChange: (params: MapGenParams) => void;
   generating: boolean;
   onGenerate: () => void;
-  file: File | null;
+  /** 当前已载入地图（上传或生成），null 表示未载入 */
+  map: LoadedMapInfo | null;
   onFileChange: (file: File | null) => void;
   running: boolean;
   onRun: () => void;
+  /** 算法运行结果的性能数据，null 表示尚未运行 */
+  perf: PerfSummary | null;
+  /** 下载当前已载入地图为 map.csv */
+  onDownloadMap: () => void;
   errors: string[];
+  /** 一次性提示（如"地图已生成并载入"） */
+  notice: string | null;
   onLoadDemo: () => void;
 }
 
@@ -55,16 +72,30 @@ function NumberField({
   );
 }
 
+function PerfItem({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div className="flex items-baseline justify-between gap-2">
+      <dt className="text-xs text-slate-400">{label}</dt>
+      <dd className="font-mono text-sm font-semibold text-slate-700">
+        {value}
+      </dd>
+    </div>
+  );
+}
+
 export default function ControlPanel({
   params,
   onParamsChange,
   generating,
   onGenerate,
-  file,
+  map,
   onFileChange,
   running,
   onRun,
+  perf,
+  onDownloadMap,
   errors,
+  notice,
   onLoadDemo,
 }: ControlPanelProps) {
   const { t } = useI18n();
@@ -133,6 +164,14 @@ export default function ControlPanel({
         >
           {generating ? t("panel.generating") : t("panel.generate")}
         </button>
+        <button
+          type="button"
+          onClick={onDownloadMap}
+          disabled={!map}
+          className="mt-2 h-9 w-full rounded-lg border border-slate-200 text-sm text-slate-500 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {t("panel.downloadMap")}
+        </button>
         <p className="mt-2 text-xs text-slate-400">{t("panel.generateHint")}</p>
       </section>
 
@@ -168,9 +207,7 @@ export default function ControlPanel({
           <span className="text-2xl">📄</span>
           <span className="text-sm text-slate-500">{t("panel.dropHint")}</span>
           <span className="text-xs text-slate-400">
-            {file
-              ? `${t("panel.selectedPrefix")}${file.name}`
-              : t("panel.noFile")}
+            {map ? `${t("panel.selectedPrefix")}${map.name}` : t("panel.noFile")}
           </span>
         </div>
         <input
@@ -180,14 +217,72 @@ export default function ControlPanel({
           className="hidden"
           onChange={(e) => onFileChange(e.target.files?.[0] ?? null)}
         />
+
+        {/* 当前已载入地图的信息（尺寸 + 元素计数） */}
+        {map && (
+          <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <p className="text-xs font-semibold text-slate-600">
+              {t("panel.mapInfoTitle")}
+            </p>
+            <p className="mt-1 font-mono text-xs text-slate-500">
+              {t("panel.mapInfo", {
+                w: map.width,
+                h: map.height,
+                agv: map.agvCount,
+                cargo: map.cargoCount,
+                port: map.portCount,
+              })}
+            </p>
+          </div>
+        )}
+
+        {/* 一次性提示（如生成后自动载入成功） */}
+        {notice && (
+          <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-600">
+            {notice}
+          </div>
+        )}
+
         <button
           type="button"
           onClick={onRun}
-          disabled={busy || !file}
+          disabled={busy || !map}
           className="mt-4 h-10 w-full rounded-lg bg-blue-600 text-sm font-medium text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {running ? t("panel.running") : t("panel.run")}
         </button>
+
+        {/* 性能展示：运行算法后填入实际数据，未运行时显示 "—" */}
+        <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
+          <p className="text-xs font-semibold text-slate-600">{t("perf.title")}</p>
+          <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-2">
+            <PerfItem
+              label={t("perf.elapsed")}
+              value={
+                perf?.elapsedMs != null ? `${perf.elapsedMs} ms` : "—"
+              }
+            />
+            <PerfItem
+              label={t("stats.makespan")}
+              value={perf?.makespan ?? "—"}
+            />
+            <PerfItem
+              label={t("stats.moves")}
+              value={perf?.totalMoves ?? "—"}
+            />
+            <PerfItem
+              label={t("stats.delivered")}
+              value={
+                perf &&
+                perf.deliveries != null &&
+                perf.totalCargos != null
+                  ? `${perf.deliveries} / ${perf.totalCargos}`
+                  : "—"
+              }
+            />
+            <PerfItem label={t("perf.agv")} value={perf?.agvCount ?? "—"} />
+          </dl>
+        </div>
         <button
           type="button"
           onClick={onLoadDemo}
