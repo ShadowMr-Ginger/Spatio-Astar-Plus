@@ -2,7 +2,7 @@
 
 A multi-AGV path planning and cargo dispatching algorithm built on **Spatio-Temporal A\***, together with a full-stack demo platform that runs it online. The algorithm prototype is C++ competition code (Huawei Software Elite Challenge, port dispatch track); this repository simplifies and ports it to a C# scheduling engine, with a Next.js frontend covering the full workflow: map generation → upload → scheduling → animated playback → schedule export.
 
-**Demo (coming soon): https://jianqiaoxu.xyz/spatio-astar**
+**Demo: https://jianqiaoxu.xyz/spatio-astar**
 
 [中文指南](中文指南/README.md)
 
